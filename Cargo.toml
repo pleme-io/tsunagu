@@ -1,0 +1,29 @@
+[package]
+name = "tsunagu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+description = "Tsunagu (繋ぐ) — service/daemon IPC framework: Unix sockets, health checks, process management"
+homepage = "https://github.com/pleme-io/tsunagu"
+repository = "https://github.com/pleme-io/tsunagu"
+readme = "README.md"
+license = "MIT"
+categories = ["network-programming"]
+keywords = ["ipc", "daemon", "service", "unix-socket", "health"]
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "2"
+dirs = "6.0"
+tokio = { version = "1", features = ["rt", "net", "signal", "sync", "macros", "time", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }
