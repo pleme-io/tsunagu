@@ -1,41 +1,52 @@
 {
-  description = "Tsunagu (繋ぐ) — service/daemon IPC framework";
+  description = "Tsunagu (繋ぐ) — service/daemon IPC framework: Unix sockets, health checks, process management";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
-    substrate = {
-      url = "github:pleme-io/substrate";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    crate2nix.url = "github:nix-community/crate2nix";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      substrate,
-      crate2nix,
       ...
     }:
     let
       system = "aarch64-darwin";
       pkgs = import nixpkgs { inherit system; };
-      rustLibrary = import "${substrate}/lib/rust-library.nix" {
-        inherit system nixpkgs;
-        nixLib = substrate;
-        inherit crate2nix;
-      };
-      lib = rustLibrary {
-        name = "tsunagu";
-        src = ./.;
+
+      props = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      version = props.package.version;
+      pname = "tsunagu";
+
+      package = pkgs.rustPlatform.buildRustPackage {
+        inherit pname version;
+        src = pkgs.lib.cleanSource ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        doCheck = true;
+        meta = {
+          description = props.package.description;
+          homepage = props.package.homepage;
+          license = pkgs.lib.licenses.mit;
+        };
       };
     in
     {
-      inherit (lib) packages devShells apps;
+      packages.${system} = {
+        tsunagu = package;
+        default = package;
+      };
 
       overlays.default = final: prev: {
         tsunagu = self.packages.${final.system}.default;
+      };
+
+      devShells.${system}.default = pkgs.mkShellNoCC {
+        packages = [
+          pkgs.rustc
+          pkgs.cargo
+          pkgs.rust-analyzer
+        ];
       };
 
       formatter.${system} = pkgs.nixfmt-tree;
