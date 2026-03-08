@@ -6,6 +6,7 @@ rust-version = "1.89.0"
 description = "Tsunagu (繋ぐ) — service/daemon IPC framework: Unix sockets, health checks, process management"
 homepage = "https://github.com/pleme-io/tsunagu"
 repository = "https://github.com/pleme-io/tsunagu"
+documentation = "https://docs.rs/tsunagu"
 readme = "README.md"
 license = "MIT"
 categories = ["network-programming"]
