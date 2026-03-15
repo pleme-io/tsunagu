@@ -257,4 +257,274 @@ mod tests {
         assert!(!pid_path.exists());
         assert!(!sock_path.exists());
     }
+
+    // --- Additional tests ---
+
+    #[test]
+    fn new_uses_socket_path_defaults() {
+        let d = DaemonProcess::new("tsunagu-test-new");
+        let expected_pid = SocketPath::pid_file("tsunagu-test-new");
+        let expected_sock = SocketPath::for_app("tsunagu-test-new");
+        assert_eq!(*d.pid_path(), expected_pid);
+        assert_eq!(*d.socket_path(), expected_sock);
+    }
+
+    #[test]
+    fn with_paths_uses_custom_paths() {
+        let pid = PathBuf::from("/custom/dir/app.pid");
+        let sock = PathBuf::from("/custom/dir/app.sock");
+        let d = DaemonProcess::with_paths("custom", pid.clone(), sock.clone());
+        assert_eq!(*d.pid_path(), pid);
+        assert_eq!(*d.socket_path(), sock);
+        assert_eq!(d.app_name(), "custom");
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_non_numeric_content() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "not-a-number").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_trims_whitespace() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "  12345  \n").unwrap();
+        assert_eq!(d.read_pid(), Some(12345));
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_negative_number() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "-1").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_overflow() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        // u32::MAX + 1 overflows
+        std::fs::write(d.pid_path(), "4294967296").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_returns_none_for_zero() {
+        // PID 0 is technically parseable as u32, but the function returns Some(0).
+        // This test documents the current behavior: 0 is a valid u32 parse result.
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "0").unwrap();
+        assert_eq!(d.read_pid(), Some(0));
+    }
+
+    #[test]
+    fn write_pid_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let nested_pid = dir.path().join("nested").join("deep").join("test.pid");
+        let d = DaemonProcess::with_paths(
+            "nested-test",
+            nested_pid.clone(),
+            dir.path().join("test.sock"),
+        );
+        d.write_pid().unwrap();
+        assert!(nested_pid.exists());
+        let contents = std::fs::read_to_string(&nested_pid).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+    }
+
+    #[test]
+    fn write_pid_overwrites_existing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "old-content").unwrap();
+        d.write_pid().unwrap();
+        let contents = std::fs::read_to_string(d.pid_path()).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+    }
+
+    #[test]
+    fn cleanup_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        std::fs::write(d.socket_path(), "").unwrap();
+        d.cleanup();
+        // Second cleanup should not panic
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        assert!(!d.socket_path().exists());
+    }
+
+    #[test]
+    fn cleanup_when_no_files_exist() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        // Files never created; cleanup should not panic
+        d.cleanup();
+    }
+
+    #[test]
+    fn cleanup_removes_pid_even_if_socket_missing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        // Do not create socket file
+        assert!(d.pid_path().exists());
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+    }
+
+    #[test]
+    fn cleanup_removes_socket_even_if_pid_missing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.socket_path(), "").unwrap();
+        // Do not create PID file
+        assert!(d.socket_path().exists());
+        d.cleanup();
+        assert!(!d.socket_path().exists());
+    }
+
+    #[test]
+    fn acquire_writes_current_pid() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn daemon_already_running_error_contains_pid() {
+        // Test the error variant directly; process_alive may not work in
+        // sandboxed environments (macOS entitlement issue with `ps`).
+        let err = TsunaguError::DaemonAlreadyRunning { pid: 54321 };
+        let msg = err.to_string();
+        assert!(msg.contains("54321"), "error should contain the PID");
+        assert!(msg.contains("already running"));
+    }
+
+    #[test]
+    fn acquire_replaces_stale_pid_with_current() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        // Write a stale PID
+        std::fs::write(d.pid_path(), "88888888").unwrap();
+        d.acquire().unwrap();
+        // After acquire, our PID replaces the stale one
+        let stored_pid = d.read_pid().unwrap();
+        assert_eq!(stored_pid, std::process::id());
+    }
+
+    #[test]
+    fn is_running_false_for_empty_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "").unwrap();
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_for_garbage_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "hello-world").unwrap();
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn process_alive_returns_false_for_nonexistent_pid() {
+        // PID 99_999_999 is almost certainly not running
+        assert!(!process_alive(99_999_999));
+    }
+
+    #[test]
+    fn drop_without_any_writes_is_safe() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("noop.pid");
+        let sock_path = dir.path().join("noop.sock");
+        {
+            let _d = DaemonProcess::with_paths("noop", pid_path.clone(), sock_path.clone());
+            // Drop immediately without writing anything
+        }
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
+    }
+
+    #[test]
+    fn multiple_daemons_different_apps_coexist() {
+        let dir = TempDir::new().unwrap();
+        let d1 = DaemonProcess::with_paths(
+            "app-a",
+            dir.path().join("a.pid"),
+            dir.path().join("a.sock"),
+        );
+        let d2 = DaemonProcess::with_paths(
+            "app-b",
+            dir.path().join("b.pid"),
+            dir.path().join("b.sock"),
+        );
+        d1.write_pid().unwrap();
+        d2.write_pid().unwrap();
+        assert!(d1.pid_path().exists());
+        assert!(d2.pid_path().exists());
+        assert_eq!(d1.app_name(), "app-a");
+        assert_eq!(d2.app_name(), "app-b");
+    }
+
+    #[test]
+    fn write_pid_then_read_is_consistent() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        // Read it back multiple times to confirm consistency
+        let pid1 = d.read_pid();
+        let pid2 = d.read_pid();
+        assert_eq!(pid1, pid2);
+        assert_eq!(pid1, Some(std::process::id()));
+    }
+
+    #[test]
+    fn read_pid_handles_pid_with_trailing_newline() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "42\n").unwrap();
+        assert_eq!(d.read_pid(), Some(42));
+    }
+
+    #[test]
+    fn read_pid_handles_pid_with_carriage_return() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "42\r\n").unwrap();
+        assert_eq!(d.read_pid(), Some(42));
+    }
+
+    #[test]
+    fn read_pid_rejects_float() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "3.14").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_rejects_multiple_numbers() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "123 456").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
 }

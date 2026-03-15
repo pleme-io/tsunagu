@@ -211,4 +211,298 @@ mod tests {
         assert_eq!(HealthStatus::Healthy, HealthStatus::Healthy);
         assert_ne!(HealthStatus::Healthy, HealthStatus::Unhealthy("x".into()));
     }
+
+    // --- Additional tests ---
+
+    #[test]
+    fn healthy_has_no_uptime_by_default() {
+        let hc = HealthCheck::healthy("svc", "1.0");
+        assert_eq!(hc.uptime_secs, None);
+    }
+
+    #[test]
+    fn unhealthy_has_no_uptime_by_default() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "crashed");
+        assert_eq!(hc.uptime_secs, None);
+    }
+
+    #[test]
+    fn degraded_has_no_uptime_by_default() {
+        let hc = HealthCheck::degraded("svc", "1.0", "slow");
+        assert_eq!(hc.uptime_secs, None);
+    }
+
+    #[test]
+    fn with_uptime_chainable() {
+        let hc = HealthCheck::healthy("svc", "1.0")
+            .with_uptime(100)
+            .with_uptime(200);
+        assert_eq!(hc.uptime_secs, Some(200));
+    }
+
+    #[test]
+    fn with_uptime_zero_is_valid() {
+        let hc = HealthCheck::healthy("svc", "1.0").with_uptime(0);
+        assert_eq!(hc.uptime_secs, Some(0));
+    }
+
+    #[test]
+    fn with_uptime_max_u64() {
+        let hc = HealthCheck::healthy("svc", "1.0").with_uptime(u64::MAX);
+        assert_eq!(hc.uptime_secs, Some(u64::MAX));
+    }
+
+    #[test]
+    fn degraded_is_not_healthy_or_unhealthy() {
+        let hc = HealthCheck::degraded("svc", "1.0", "slow query");
+        assert!(hc.is_degraded());
+        assert!(!hc.is_healthy());
+        assert!(!hc.is_unhealthy());
+    }
+
+    #[test]
+    fn unhealthy_is_not_healthy_or_degraded() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "crash");
+        assert!(hc.is_unhealthy());
+        assert!(!hc.is_healthy());
+        assert!(!hc.is_degraded());
+    }
+
+    #[test]
+    fn display_degraded() {
+        let hc = HealthCheck::degraded("myapp", "2.0.1", "high latency");
+        let s = hc.to_string();
+        assert!(s.contains("myapp"));
+        assert!(s.contains("2.0.1"));
+        assert!(s.contains("degraded"));
+        assert!(s.contains("high latency"));
+    }
+
+    #[test]
+    fn display_healthy_no_uptime_has_no_uptime_text() {
+        let hc = HealthCheck::healthy("svc", "1.0");
+        let s = hc.to_string();
+        assert!(!s.contains("uptime"));
+    }
+
+    #[test]
+    fn display_format_with_version() {
+        let hc = HealthCheck::healthy("mado", "0.3.7");
+        let s = hc.to_string();
+        assert!(s.contains("v0.3.7"), "display should show 'v' prefix on version: {s}");
+    }
+
+    #[test]
+    fn serde_roundtrip_unhealthy() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "timeout");
+        let json = serde_json::to_string(&hc).unwrap();
+        let deserialized: HealthCheck = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.is_unhealthy());
+        assert_eq!(deserialized.service, "svc");
+        assert_eq!(deserialized.version, "1.0");
+        match &deserialized.status {
+            HealthStatus::Unhealthy(reason) => assert_eq!(reason, "timeout"),
+            other => panic!("expected Unhealthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_with_uptime() {
+        let hc = HealthCheck::healthy("svc", "1.0").with_uptime(42);
+        let json = serde_json::to_string(&hc).unwrap();
+        let deserialized: HealthCheck = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.uptime_secs, Some(42));
+    }
+
+    #[test]
+    fn serde_roundtrip_without_uptime() {
+        let hc = HealthCheck::healthy("svc", "1.0");
+        let json = serde_json::to_string(&hc).unwrap();
+        let deserialized: HealthCheck = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.uptime_secs, None);
+    }
+
+    #[test]
+    fn to_json_contains_service_field() {
+        let hc = HealthCheck::healthy("myservice", "0.1.0");
+        let json = hc.to_json().unwrap();
+        assert!(json.contains("\"service\""));
+        assert!(json.contains("myservice"));
+    }
+
+    #[test]
+    fn to_json_contains_status_field() {
+        let hc = HealthCheck::healthy("svc", "1.0");
+        let json = hc.to_json().unwrap();
+        assert!(json.contains("\"status\""));
+        assert!(json.contains("Healthy"));
+    }
+
+    #[test]
+    fn to_json_unhealthy_contains_reason() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "disk full");
+        let json = hc.to_json().unwrap();
+        assert!(json.contains("disk full"));
+    }
+
+    #[test]
+    fn to_json_degraded_contains_reason() {
+        let hc = HealthCheck::degraded("svc", "1.0", "memory pressure");
+        let json = hc.to_json().unwrap();
+        assert!(json.contains("memory pressure"));
+    }
+
+    #[test]
+    fn health_status_clone() {
+        let status = HealthStatus::Degraded("reason".to_string());
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn health_check_clone() {
+        let hc = HealthCheck::healthy("svc", "1.0").with_uptime(10);
+        let cloned = hc.clone();
+        assert_eq!(cloned.service, hc.service);
+        assert_eq!(cloned.version, hc.version);
+        assert_eq!(cloned.status, hc.status);
+        assert_eq!(cloned.uptime_secs, hc.uptime_secs);
+    }
+
+    #[test]
+    fn health_status_debug_format() {
+        let status = HealthStatus::Healthy;
+        let debug = format!("{status:?}");
+        assert!(debug.contains("Healthy"));
+    }
+
+    #[test]
+    fn health_check_debug_format() {
+        let hc = HealthCheck::healthy("svc", "1.0");
+        let debug = format!("{hc:?}");
+        assert!(debug.contains("svc"));
+        assert!(debug.contains("Healthy"));
+    }
+
+    #[test]
+    fn degraded_status_equality_same_reason() {
+        let a = HealthStatus::Degraded("slow".to_string());
+        let b = HealthStatus::Degraded("slow".to_string());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn degraded_status_inequality_different_reasons() {
+        let a = HealthStatus::Degraded("slow".to_string());
+        let b = HealthStatus::Degraded("timeout".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn unhealthy_status_equality_same_reason() {
+        let a = HealthStatus::Unhealthy("crash".to_string());
+        let b = HealthStatus::Unhealthy("crash".to_string());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn unhealthy_status_inequality_different_reasons() {
+        let a = HealthStatus::Unhealthy("crash".to_string());
+        let b = HealthStatus::Unhealthy("oom".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn degraded_not_equal_to_unhealthy() {
+        let a = HealthStatus::Degraded("reason".to_string());
+        let b = HealthStatus::Unhealthy("reason".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn empty_service_name() {
+        let hc = HealthCheck::healthy("", "1.0");
+        assert_eq!(hc.service, "");
+        assert!(hc.is_healthy());
+    }
+
+    #[test]
+    fn empty_version() {
+        let hc = HealthCheck::healthy("svc", "");
+        assert_eq!(hc.version, "");
+    }
+
+    #[test]
+    fn empty_reason_degraded() {
+        let hc = HealthCheck::degraded("svc", "1.0", "");
+        assert!(hc.is_degraded());
+        assert_eq!(hc.status, HealthStatus::Degraded(String::new()));
+    }
+
+    #[test]
+    fn empty_reason_unhealthy() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "");
+        assert!(hc.is_unhealthy());
+        assert_eq!(hc.status, HealthStatus::Unhealthy(String::new()));
+    }
+
+    #[test]
+    fn unicode_service_name() {
+        let hc = HealthCheck::healthy("繋ぐ", "0.1.0");
+        assert_eq!(hc.service, "繋ぐ");
+        let json = hc.to_json().unwrap();
+        let deserialized: HealthCheck = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.service, "繋ぐ");
+    }
+
+    #[test]
+    fn unicode_reason() {
+        let hc = HealthCheck::unhealthy("svc", "1.0", "接続エラー");
+        let json = serde_json::to_string(&hc).unwrap();
+        let deserialized: HealthCheck = serde_json::from_str(&json).unwrap();
+        match &deserialized.status {
+            HealthStatus::Unhealthy(reason) => assert_eq!(reason, "接続エラー"),
+            other => panic!("expected Unhealthy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_from_known_json_structure() {
+        // Verify that the serde format is stable and expected
+        let json = r#"{
+            "service": "test",
+            "status": "Healthy",
+            "version": "1.0",
+            "uptime_secs": null
+        }"#;
+        let hc: HealthCheck = serde_json::from_str(json).unwrap();
+        assert!(hc.is_healthy());
+        assert_eq!(hc.service, "test");
+        assert_eq!(hc.uptime_secs, None);
+    }
+
+    #[test]
+    fn deserialize_degraded_from_json() {
+        let json = r#"{
+            "service": "test",
+            "status": {"Degraded": "slow query"},
+            "version": "2.0",
+            "uptime_secs": 300
+        }"#;
+        let hc: HealthCheck = serde_json::from_str(json).unwrap();
+        assert!(hc.is_degraded());
+        assert_eq!(hc.uptime_secs, Some(300));
+    }
+
+    #[test]
+    fn deserialize_unhealthy_from_json() {
+        let json = r#"{
+            "service": "test",
+            "status": {"Unhealthy": "disk full"},
+            "version": "3.0",
+            "uptime_secs": null
+        }"#;
+        let hc: HealthCheck = serde_json::from_str(json).unwrap();
+        assert!(hc.is_unhealthy());
+    }
 }
