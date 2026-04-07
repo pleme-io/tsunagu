@@ -2,6 +2,7 @@ use std::fmt;
 
 /// Health status for a daemon service.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum HealthStatus {
     /// Service is fully operational.
     Healthy,

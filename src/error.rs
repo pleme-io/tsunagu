@@ -1,5 +1,6 @@
 /// Errors produced by the tsunagu IPC framework.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum TsunaguError {
     /// The daemon is not running at the expected PID file path.
     #[error("daemon not running at {}", path.display())]
