@@ -97,19 +97,19 @@ impl HealthCheck {
     /// Whether the service is healthy.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        matches!(self.status, HealthStatus::Healthy)
+        self.status.is_healthy()
     }
 
     /// Whether the service is degraded (running but impaired).
     #[must_use]
     pub fn is_degraded(&self) -> bool {
-        matches!(self.status, HealthStatus::Degraded(_))
+        self.status.is_degraded()
     }
 
     /// Whether the service is unhealthy.
     #[must_use]
     pub fn is_unhealthy(&self) -> bool {
-        matches!(self.status, HealthStatus::Unhealthy(_))
+        self.status.is_unhealthy()
     }
 
     /// Deserialize from a JSON string.
