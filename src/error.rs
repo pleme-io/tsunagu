@@ -33,6 +33,10 @@ pub enum TsunaguError {
         /// Description of why the PID file is invalid.
         reason: String,
     },
+
+    /// JSON serialization/deserialization failed.
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 #[cfg(test)]
@@ -132,5 +136,21 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("daemon not running at"));
+    }
+
+    #[test]
+    fn serialization_error_from_conversion() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err: TsunaguError = json_err.into();
+        let msg = err.to_string();
+        assert!(msg.contains("serialization error"));
+    }
+
+    #[test]
+    fn serialization_error_is_debug_formattable() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err();
+        let err: TsunaguError = json_err.into();
+        let debug = format!("{err:?}");
+        assert!(debug.contains("Serialization"));
     }
 }

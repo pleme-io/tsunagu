@@ -87,9 +87,9 @@ impl HealthCheck {
         matches!(self.status, HealthStatus::Unhealthy(_))
     }
 
-    /// Serialize to JSON string.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+    /// Serialize to a pretty-printed JSON string.
+    pub fn to_json(&self) -> Result<String, crate::TsunaguError> {
+        Ok(serde_json::to_string_pretty(self)?)
     }
 }
 
