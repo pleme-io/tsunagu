@@ -173,6 +173,17 @@ impl<C: ProcessChecker> Drop for DaemonProcess<C> {
     }
 }
 
+impl<C: ProcessChecker> std::fmt::Display for DaemonProcess<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DaemonProcess({}, pid={})",
+            self.app_name,
+            self.pid_path.display(),
+        )
+    }
+}
+
 /// Check if a process with the given PID is alive.
 ///
 /// Convenience wrapper around [`SystemProcessChecker`], retained for
@@ -750,5 +761,14 @@ mod tests {
         let checker = SystemProcessChecker::default();
         assert!(checker.is_alive(std::process::id()));
         assert!(!checker.is_alive(99_999_999));
+    }
+
+    #[test]
+    fn display_includes_app_name_and_pid_path() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        let s = d.to_string();
+        assert!(s.contains("test-app"), "display should contain app name: {s}");
+        assert!(s.contains("test.pid"), "display should contain pid path: {s}");
     }
 }
