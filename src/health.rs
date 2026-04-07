@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 /// Health status for a daemon service.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +104,39 @@ impl fmt::Display for HealthStatus {
             Self::Degraded(r) => write!(f, "degraded: {r}"),
             Self::Unhealthy(r) => write!(f, "unhealthy: {r}"),
         }
+    }
+}
+
+/// Parse error returned when a string cannot be interpreted as a [`HealthStatus`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseHealthStatusError {
+    input: String,
+}
+
+impl fmt::Display for ParseHealthStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid health status: {:?}", self.input)
+    }
+}
+
+impl std::error::Error for ParseHealthStatusError {}
+
+impl FromStr for HealthStatus {
+    type Err = ParseHealthStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "healthy" {
+            return Ok(Self::Healthy);
+        }
+        if let Some(reason) = s.strip_prefix("degraded: ") {
+            return Ok(Self::Degraded(reason.to_string()));
+        }
+        if let Some(reason) = s.strip_prefix("unhealthy: ") {
+            return Ok(Self::Unhealthy(reason.to_string()));
+        }
+        Err(ParseHealthStatusError {
+            input: s.to_string(),
+        })
     }
 }
 
@@ -550,5 +584,47 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: HealthCheck = serde_json::from_str(&json).unwrap();
         assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn fromstr_healthy_roundtrips() {
+        let status = HealthStatus::Healthy;
+        let parsed: HealthStatus = status.to_string().parse().unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn fromstr_degraded_roundtrips() {
+        let status = HealthStatus::Degraded("slow query".to_string());
+        let parsed: HealthStatus = status.to_string().parse().unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn fromstr_unhealthy_roundtrips() {
+        let status = HealthStatus::Unhealthy("disk full".to_string());
+        let parsed: HealthStatus = status.to_string().parse().unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn fromstr_rejects_garbage() {
+        let result = "not a status".parse::<HealthStatus>();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("not a status"));
+    }
+
+    #[test]
+    fn fromstr_rejects_empty_string() {
+        assert!("".parse::<HealthStatus>().is_err());
+    }
+
+    #[test]
+    fn parse_health_status_error_is_std_error() {
+        let err: Box<dyn std::error::Error> = Box::new(
+            "bad".parse::<HealthStatus>().unwrap_err(),
+        );
+        assert!(err.to_string().contains("bad"));
     }
 }
