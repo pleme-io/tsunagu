@@ -1,6 +1,6 @@
 use crate::error::TsunaguError;
 use crate::socket::SocketPath;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Daemon process lifecycle management.
 ///
@@ -80,13 +80,13 @@ impl DaemonProcess {
 
     /// Path to the Unix socket.
     #[must_use]
-    pub fn socket_path(&self) -> &PathBuf {
+    pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
     /// Path to the PID file.
     #[must_use]
-    pub fn pid_path(&self) -> &PathBuf {
+    pub fn pid_path(&self) -> &Path {
         &self.pid_path
     }
 
