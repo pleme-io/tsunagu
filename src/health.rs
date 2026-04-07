@@ -13,6 +13,12 @@ pub enum HealthStatus {
     Unhealthy(String),
 }
 
+impl Default for HealthStatus {
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
 /// Standardized health check response for daemon services.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HealthCheck {
@@ -626,5 +632,10 @@ mod tests {
             "bad".parse::<HealthStatus>().unwrap_err(),
         );
         assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn health_status_default_is_healthy() {
+        assert_eq!(HealthStatus::default(), HealthStatus::Healthy);
     }
 }
