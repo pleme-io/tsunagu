@@ -14,6 +14,35 @@ pub enum HealthStatus {
     Unhealthy(String),
 }
 
+impl HealthStatus {
+    /// Returns the reason string for `Degraded` or `Unhealthy`, `None` for `Healthy`.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Healthy => None,
+            Self::Degraded(r) | Self::Unhealthy(r) => Some(r),
+        }
+    }
+
+    /// `true` when `Healthy`.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    /// `true` when `Degraded`.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        matches!(self, Self::Degraded(_))
+    }
+
+    /// `true` when `Unhealthy`.
+    #[must_use]
+    pub fn is_unhealthy(&self) -> bool {
+        matches!(self, Self::Unhealthy(_))
+    }
+}
+
 /// Standardized health check response for daemon services.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -699,6 +728,41 @@ mod tests {
             "bad".parse::<HealthStatus>().unwrap_err(),
         );
         assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn status_reason_healthy_is_none() {
+        assert_eq!(HealthStatus::Healthy.reason(), None);
+    }
+
+    #[test]
+    fn status_reason_degraded() {
+        let s = HealthStatus::Degraded("slow".into());
+        assert_eq!(s.reason(), Some("slow"));
+    }
+
+    #[test]
+    fn status_reason_unhealthy() {
+        let s = HealthStatus::Unhealthy("crash".into());
+        assert_eq!(s.reason(), Some("crash"));
+    }
+
+    #[test]
+    fn status_is_healthy() {
+        assert!(HealthStatus::Healthy.is_healthy());
+        assert!(!HealthStatus::Degraded("x".into()).is_healthy());
+    }
+
+    #[test]
+    fn status_is_degraded() {
+        assert!(HealthStatus::Degraded("x".into()).is_degraded());
+        assert!(!HealthStatus::Healthy.is_degraded());
+    }
+
+    #[test]
+    fn status_is_unhealthy() {
+        assert!(HealthStatus::Unhealthy("x".into()).is_unhealthy());
+        assert!(!HealthStatus::Healthy.is_unhealthy());
     }
 
     #[test]
