@@ -11,7 +11,7 @@ impl SocketPath {
     /// Returns `{runtime_dir}/{app_name}/{app_name}.sock`
     #[must_use]
     pub fn for_app(app_name: &str) -> PathBuf {
-        Self::runtime_base(app_name).join(format!("{app_name}.sock"))
+        Self::app_file(app_name, "sock")
     }
 
     /// Resolve the PID file path for an application daemon.
@@ -19,7 +19,7 @@ impl SocketPath {
     /// Returns `{runtime_dir}/{app_name}/{app_name}.pid`
     #[must_use]
     pub fn pid_file(app_name: &str) -> PathBuf {
-        Self::runtime_base(app_name).join(format!("{app_name}.pid"))
+        Self::app_file(app_name, "pid")
     }
 
     /// Resolve the base runtime directory for an application.
@@ -32,6 +32,11 @@ impl SocketPath {
             PathBuf::from,
         );
         base.join(app_name)
+    }
+
+    /// Internal helper: `runtime_base(app) / {app}.{ext}`.
+    fn app_file(app_name: &str, ext: &str) -> PathBuf {
+        Self::runtime_base(app_name).join(format!("{app_name}.{ext}"))
     }
 }
 
