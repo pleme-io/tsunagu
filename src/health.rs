@@ -2,7 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Health status for a daemon service.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum HealthStatus {
     /// Service is fully operational.
@@ -44,7 +44,7 @@ impl HealthStatus {
 }
 
 /// Standardized health check response for daemon services.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct HealthCheck {
     pub service: String,
@@ -728,6 +728,26 @@ mod tests {
             "bad".parse::<HealthStatus>().unwrap_err(),
         );
         assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn health_check_usable_in_hash_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(HealthCheck::healthy("a", "1.0"));
+        set.insert(HealthCheck::healthy("b", "1.0"));
+        set.insert(HealthCheck::healthy("a", "1.0"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn health_status_usable_in_hash_set() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(HealthStatus::Healthy);
+        set.insert(HealthStatus::Degraded("slow".into()));
+        set.insert(HealthStatus::Healthy);
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
