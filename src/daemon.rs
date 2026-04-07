@@ -2,16 +2,65 @@ use crate::error::TsunaguError;
 use crate::socket::SocketPath;
 use std::path::{Path, PathBuf};
 
+/// Abstraction for checking whether a process is alive.
+///
+/// The default implementation ([`SystemProcessChecker`]) probes `/proc` on
+/// Linux and falls back to `ps -p` elsewhere.  Consumers can supply a
+/// custom implementation (or [`MockProcessChecker`] in tests) to
+/// [`DaemonProcess::with_checker`] to avoid real I/O in unit tests.
+pub trait ProcessChecker: Send + Sync {
+    /// Return `true` when the process identified by `pid` is alive.
+    fn is_alive(&self, pid: u32) -> bool;
+}
+
+/// [`ProcessChecker`] that queries the operating system.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemProcessChecker;
+
+impl ProcessChecker for SystemProcessChecker {
+    fn is_alive(&self, pid: u32) -> bool {
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        if proc_path.exists() {
+            return true;
+        }
+
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// A test double that always returns a fixed answer.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub struct MockProcessChecker {
+    pub alive: bool,
+}
+
+#[cfg(test)]
+impl ProcessChecker for MockProcessChecker {
+    fn is_alive(&self, _pid: u32) -> bool {
+        self.alive
+    }
+}
+
 /// Daemon process lifecycle management.
 ///
 /// Handles PID file creation, staleness detection, and graceful cleanup.
 /// The PID file and socket are automatically removed on drop.
-pub struct DaemonProcess {
+///
+/// Generic over [`ProcessChecker`]; defaults to [`SystemProcessChecker`].
+pub struct DaemonProcess<C: ProcessChecker = SystemProcessChecker> {
     app_name: String,
     pid_path: PathBuf,
     socket_path: PathBuf,
+    checker: C,
 }
 
+/// Constructors that use the real operating-system process checker.
 impl DaemonProcess {
     /// Create a new daemon process manager for the given application.
     #[must_use]
@@ -20,6 +69,7 @@ impl DaemonProcess {
             app_name: app_name.to_string(),
             pid_path: SocketPath::pid_file(app_name),
             socket_path: SocketPath::for_app(app_name),
+            checker: SystemProcessChecker,
         }
     }
 
@@ -30,13 +80,32 @@ impl DaemonProcess {
             app_name: app_name.to_string(),
             pid_path,
             socket_path,
+            checker: SystemProcessChecker,
+        }
+    }
+}
+
+impl<C: ProcessChecker> DaemonProcess<C> {
+    /// Create a daemon process with custom paths and a custom [`ProcessChecker`].
+    #[must_use]
+    pub fn with_checker(
+        app_name: &str,
+        pid_path: PathBuf,
+        socket_path: PathBuf,
+        checker: C,
+    ) -> Self {
+        Self {
+            app_name: app_name.to_string(),
+            pid_path,
+            socket_path,
+            checker,
         }
     }
 
     /// Check if a daemon is already running (PID file exists and process is alive).
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.read_pid().is_some_and(process_alive)
+        self.read_pid().is_some_and(|pid| self.checker.is_alive(pid))
     }
 
     /// Read the PID from the PID file, if it exists and is valid.
@@ -62,10 +131,9 @@ impl DaemonProcess {
     /// Returns `Err(DaemonAlreadyRunning)` if another instance is alive.
     pub fn acquire(&self) -> Result<(), TsunaguError> {
         if let Some(pid) = self.read_pid() {
-            if process_alive(pid) {
+            if self.checker.is_alive(pid) {
                 return Err(TsunaguError::DaemonAlreadyRunning { pid });
             }
-            // Stale PID file — remove it
             tracing::warn!(pid, "removing stale PID file");
             let _ = std::fs::remove_file(&self.pid_path);
         }
@@ -97,7 +165,7 @@ impl DaemonProcess {
     }
 }
 
-impl Drop for DaemonProcess {
+impl<C: ProcessChecker> Drop for DaemonProcess<C> {
     fn drop(&mut self) {
         self.cleanup();
     }
@@ -105,21 +173,11 @@ impl Drop for DaemonProcess {
 
 /// Check if a process with the given PID is alive.
 ///
-/// Uses `/proc/{pid}` on Linux, falls back to `ps -p` on macOS/other Unix.
-pub(crate) fn process_alive(pid: u32) -> bool {
-    // Try /proc first (Linux)
-    let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
-    if proc_path.exists() {
-        return true;
-    }
-
-    // Fallback to `ps -p` (macOS + other Unix)
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+/// Convenience wrapper around [`SystemProcessChecker`], retained for
+/// backward-compatible test assertions.
+#[cfg(test)]
+fn process_alive(pid: u32) -> bool {
+    SystemProcessChecker.is_alive(pid)
 }
 
 #[cfg(test)]
@@ -629,5 +687,66 @@ mod tests {
         let d = DaemonProcess::with_paths("exact", pid, sock);
         assert_eq!(d.pid_path().to_str().unwrap(), "/tmp/special-dir/my.pid");
         assert_eq!(d.socket_path().to_str().unwrap(), "/var/run/my.sock");
+    }
+
+    #[test]
+    fn mock_checker_always_alive() {
+        let dir = TempDir::new().unwrap();
+        let d = DaemonProcess::with_checker(
+            "mock-app",
+            dir.path().join("m.pid"),
+            dir.path().join("m.sock"),
+            MockProcessChecker { alive: true },
+        );
+        std::fs::write(d.pid_path(), "12345").unwrap();
+        assert!(d.is_running());
+    }
+
+    #[test]
+    fn mock_checker_never_alive() {
+        let dir = TempDir::new().unwrap();
+        let d = DaemonProcess::with_checker(
+            "mock-app",
+            dir.path().join("m.pid"),
+            dir.path().join("m.sock"),
+            MockProcessChecker { alive: false },
+        );
+        std::fs::write(d.pid_path(), "12345").unwrap();
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn mock_checker_acquire_blocks_when_alive() {
+        let dir = TempDir::new().unwrap();
+        let d = DaemonProcess::with_checker(
+            "mock-app",
+            dir.path().join("m.pid"),
+            dir.path().join("m.sock"),
+            MockProcessChecker { alive: true },
+        );
+        std::fs::write(d.pid_path(), "999").unwrap();
+        let err = d.acquire().unwrap_err();
+        assert!(err.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn mock_checker_acquire_succeeds_when_dead() {
+        let dir = TempDir::new().unwrap();
+        let d = DaemonProcess::with_checker(
+            "mock-app",
+            dir.path().join("m.pid"),
+            dir.path().join("m.sock"),
+            MockProcessChecker { alive: false },
+        );
+        std::fs::write(d.pid_path(), "999").unwrap();
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn system_process_checker_default() {
+        let checker = SystemProcessChecker::default();
+        assert!(checker.is_alive(std::process::id()));
+        assert!(!checker.is_alive(99_999_999));
     }
 }

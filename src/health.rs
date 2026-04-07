@@ -2,21 +2,16 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Health status for a daemon service.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum HealthStatus {
     /// Service is fully operational.
+    #[default]
     Healthy,
     /// Service is running but with degraded functionality.
     Degraded(String),
     /// Service is not operational.
     Unhealthy(String),
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self::Healthy
-    }
 }
 
 /// Standardized health check response for daemon services.
