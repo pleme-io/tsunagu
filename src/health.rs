@@ -500,4 +500,54 @@ mod tests {
         let hc: HealthCheck = serde_json::from_str(json).unwrap();
         assert!(hc.is_unhealthy());
     }
+
+    #[test]
+    fn health_check_equality_same() {
+        let a = HealthCheck::healthy("svc", "1.0").with_uptime(10);
+        let b = HealthCheck::healthy("svc", "1.0").with_uptime(10);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn health_check_inequality_different_status() {
+        let a = HealthCheck::healthy("svc", "1.0");
+        let b = HealthCheck::unhealthy("svc", "1.0", "down");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn health_check_inequality_different_service() {
+        let a = HealthCheck::healthy("svc-a", "1.0");
+        let b = HealthCheck::healthy("svc-b", "1.0");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn health_check_inequality_different_version() {
+        let a = HealthCheck::healthy("svc", "1.0");
+        let b = HealthCheck::healthy("svc", "2.0");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn health_check_inequality_different_uptime() {
+        let a = HealthCheck::healthy("svc", "1.0").with_uptime(10);
+        let b = HealthCheck::healthy("svc", "1.0").with_uptime(20);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn health_check_inequality_uptime_some_vs_none() {
+        let a = HealthCheck::healthy("svc", "1.0");
+        let b = HealthCheck::healthy("svc", "1.0").with_uptime(0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_equality() {
+        let original = HealthCheck::degraded("svc", "3.0", "high load").with_uptime(999);
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: HealthCheck = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
 }

@@ -527,4 +527,107 @@ mod tests {
         std::fs::write(d.pid_path(), "123 456").unwrap();
         assert_eq!(d.read_pid(), None);
     }
+
+    #[test]
+    fn process_alive_returns_true_for_current_process() {
+        assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn process_alive_returns_false_for_pid_one_billion() {
+        assert!(!process_alive(1_000_000_000));
+    }
+
+    #[test]
+    fn full_lifecycle_acquire_check_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+
+        assert!(!d.is_running());
+        assert_eq!(d.read_pid(), None);
+
+        d.acquire().unwrap();
+        assert!(d.is_running());
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+        assert!(d.pid_path().exists());
+
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn acquire_then_drop_cleans_pid() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("lifecycle.pid");
+        let sock_path = dir.path().join("lifecycle.sock");
+        {
+            let d = DaemonProcess::with_paths(
+                "lifecycle",
+                pid_path.clone(),
+                sock_path.clone(),
+            );
+            d.acquire().unwrap();
+            assert!(pid_path.exists());
+        }
+        assert!(!pid_path.exists());
+    }
+
+    #[tokio::test]
+    async fn socket_handshake_with_pid_lifecycle() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.acquire().unwrap();
+
+        let listener = UnixListener::bind(d.socket_path()).unwrap();
+
+        let client_path = d.socket_path().to_path_buf();
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping").await.unwrap();
+        });
+
+        let (mut conn, _addr) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4];
+        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        client.await.unwrap();
+
+        assert!(d.is_running());
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        assert!(!d.socket_path().exists());
+    }
+
+    #[test]
+    fn acquire_error_variant_matches_daemon_already_running() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("test.pid");
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        let d = DaemonProcess::with_paths(
+            "test-app",
+            pid_path,
+            dir.path().join("test.sock"),
+        );
+        let err = d.acquire().unwrap_err();
+        match err {
+            TsunaguError::DaemonAlreadyRunning { pid } => {
+                assert_eq!(pid, std::process::id());
+            }
+            other => panic!("expected DaemonAlreadyRunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_paths_preserves_exact_paths() {
+        let pid = PathBuf::from("/tmp/special-dir/my.pid");
+        let sock = PathBuf::from("/var/run/my.sock");
+        let d = DaemonProcess::with_paths("exact", pid, sock);
+        assert_eq!(d.pid_path().to_str().unwrap(), "/tmp/special-dir/my.pid");
+        assert_eq!(d.socket_path().to_str().unwrap(), "/var/run/my.sock");
+    }
 }
