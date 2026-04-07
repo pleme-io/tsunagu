@@ -83,6 +83,7 @@ impl HealthCheck {
     }
 
     /// Serialize to a pretty-printed JSON string.
+    #[must_use = "serialization may fail; handle the error"]
     pub fn to_json(&self) -> Result<String, crate::TsunaguError> {
         Ok(serde_json::to_string_pretty(self)?)
     }

@@ -118,6 +118,7 @@ impl<C: ProcessChecker> DaemonProcess<C> {
     /// Write PID file for the current process.
     ///
     /// Creates parent directories if needed.
+    #[must_use = "PID write may fail; handle the error"]
     pub fn write_pid(&self) -> Result<(), TsunaguError> {
         if let Some(parent) = self.pid_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -129,6 +130,7 @@ impl<C: ProcessChecker> DaemonProcess<C> {
     /// Acquire the daemon lock: write PID if not already running.
     ///
     /// Returns `Err(DaemonAlreadyRunning)` if another instance is alive.
+    #[must_use = "acquire may fail if daemon is already running"]
     pub fn acquire(&self) -> Result<(), TsunaguError> {
         if let Some(pid) = self.read_pid() {
             if self.checker.is_alive(pid) {
