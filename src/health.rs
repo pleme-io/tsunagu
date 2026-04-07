@@ -87,6 +87,63 @@ impl HealthCheck {
     pub fn to_json(&self) -> Result<String, crate::TsunaguError> {
         Ok(serde_json::to_string_pretty(self)?)
     }
+
+    /// Start building a [`HealthCheck`] with the required fields.
+    #[must_use]
+    pub fn builder(service: &str, version: &str) -> HealthCheckBuilder {
+        HealthCheckBuilder {
+            service: service.to_string(),
+            version: version.to_string(),
+            status: HealthStatus::Healthy,
+            uptime_secs: None,
+        }
+    }
+}
+
+/// Incremental builder for [`HealthCheck`].
+///
+/// ```
+/// use tsunagu::{HealthCheck, HealthStatus};
+///
+/// let hc = HealthCheck::builder("myapp", "0.1.0")
+///     .status(HealthStatus::Degraded("slow".into()))
+///     .uptime_secs(120)
+///     .build();
+/// assert!(hc.is_degraded());
+/// ```
+#[derive(Debug, Clone)]
+pub struct HealthCheckBuilder {
+    service: String,
+    version: String,
+    status: HealthStatus,
+    uptime_secs: Option<u64>,
+}
+
+impl HealthCheckBuilder {
+    /// Set the health status (defaults to [`HealthStatus::Healthy`]).
+    #[must_use]
+    pub fn status(mut self, status: HealthStatus) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Set uptime in seconds.
+    #[must_use]
+    pub fn uptime_secs(mut self, secs: u64) -> Self {
+        self.uptime_secs = Some(secs);
+        self
+    }
+
+    /// Consume the builder and produce a [`HealthCheck`].
+    #[must_use]
+    pub fn build(self) -> HealthCheck {
+        HealthCheck {
+            service: self.service,
+            status: self.status,
+            version: self.version,
+            uptime_secs: self.uptime_secs,
+        }
+    }
 }
 
 impl fmt::Display for HealthCheck {
@@ -633,5 +690,43 @@ mod tests {
     #[test]
     fn health_status_default_is_healthy() {
         assert_eq!(HealthStatus::default(), HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn builder_defaults_to_healthy() {
+        let hc = HealthCheck::builder("svc", "1.0").build();
+        assert!(hc.is_healthy());
+        assert_eq!(hc.service, "svc");
+        assert_eq!(hc.version, "1.0");
+        assert_eq!(hc.uptime_secs, None);
+    }
+
+    #[test]
+    fn builder_with_status_and_uptime() {
+        let hc = HealthCheck::builder("svc", "2.0")
+            .status(HealthStatus::Degraded("slow".into()))
+            .uptime_secs(300)
+            .build();
+        assert!(hc.is_degraded());
+        assert_eq!(hc.uptime_secs, Some(300));
+    }
+
+    #[test]
+    fn builder_unhealthy() {
+        let hc = HealthCheck::builder("svc", "1.0")
+            .status(HealthStatus::Unhealthy("crash".into()))
+            .build();
+        assert!(hc.is_unhealthy());
+    }
+
+    #[test]
+    fn builder_clone() {
+        let b = HealthCheck::builder("svc", "1.0").uptime_secs(10);
+        let hc1 = b.clone().status(HealthStatus::Healthy).build();
+        let hc2 = b.status(HealthStatus::Unhealthy("x".into())).build();
+        assert!(hc1.is_healthy());
+        assert!(hc2.is_unhealthy());
+        assert_eq!(hc1.uptime_secs, Some(10));
+        assert_eq!(hc2.uptime_secs, Some(10));
     }
 }
