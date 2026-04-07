@@ -12,7 +12,7 @@ pub enum HealthStatus {
 }
 
 /// Standardized health check response for daemon services.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HealthCheck {
     pub service: String,
     pub status: HealthStatus,
