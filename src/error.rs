@@ -1,20 +1,37 @@
 /// Errors produced by the tsunagu IPC framework.
 #[derive(Debug, thiserror::Error)]
 pub enum TsunaguError {
-    #[error("daemon not running at {path}")]
-    DaemonNotRunning { path: String },
+    /// The daemon is not running at the expected PID file path.
+    #[error("daemon not running at {}", path.display())]
+    DaemonNotRunning {
+        /// Path to the PID file that was checked.
+        path: std::path::PathBuf,
+    },
 
+    /// Another daemon instance is already running.
     #[error("daemon already running (pid {pid})")]
-    DaemonAlreadyRunning { pid: u32 },
+    DaemonAlreadyRunning {
+        /// PID of the running daemon.
+        pid: u32,
+    },
 
+    /// An underlying I/O error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("health check failed: {0}")]
-    HealthCheck(String),
+    /// A health check failed.
+    #[error("health check failed: {reason}")]
+    HealthCheck {
+        /// Human-readable failure reason.
+        reason: String,
+    },
 
-    #[error("invalid PID file: {0}")]
-    InvalidPidFile(String),
+    /// The PID file contained invalid content.
+    #[error("invalid PID file: {reason}")]
+    InvalidPidFile {
+        /// Description of why the PID file is invalid.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -24,7 +41,7 @@ mod tests {
     #[test]
     fn daemon_not_running_display() {
         let err = TsunaguError::DaemonNotRunning {
-            path: "/run/myapp/myapp.pid".to_string(),
+            path: std::path::PathBuf::from("/run/myapp/myapp.pid"),
         };
         let msg = err.to_string();
         assert!(msg.contains("daemon not running"));
@@ -50,7 +67,9 @@ mod tests {
 
     #[test]
     fn health_check_error_display() {
-        let err = TsunaguError::HealthCheck("connection timeout".to_string());
+        let err = TsunaguError::HealthCheck {
+            reason: "connection timeout".to_string(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("health check failed"));
         assert!(msg.contains("connection timeout"));
@@ -58,7 +77,9 @@ mod tests {
 
     #[test]
     fn invalid_pid_file_display() {
-        let err = TsunaguError::InvalidPidFile("contains garbage".to_string());
+        let err = TsunaguError::InvalidPidFile {
+            reason: "contains garbage".to_string(),
+        };
         let msg = err.to_string();
         assert!(msg.contains("invalid PID file"));
         assert!(msg.contains("contains garbage"));
@@ -83,9 +104,9 @@ mod tests {
 
     #[test]
     fn error_implements_std_error() {
-        // Verify TsunaguError implements std::error::Error
-        let err: Box<dyn std::error::Error> =
-            Box::new(TsunaguError::HealthCheck("test".to_string()));
+        let err: Box<dyn std::error::Error> = Box::new(TsunaguError::HealthCheck {
+            reason: "test".to_string(),
+        });
         assert!(err.to_string().contains("health check failed"));
     }
 
@@ -106,7 +127,7 @@ mod tests {
     #[test]
     fn daemon_not_running_empty_path() {
         let err = TsunaguError::DaemonNotRunning {
-            path: String::new(),
+            path: std::path::PathBuf::new(),
         };
         let msg = err.to_string();
         assert!(msg.contains("daemon not running at"));
