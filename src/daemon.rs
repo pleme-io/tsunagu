@@ -103,10 +103,10 @@ impl Drop for DaemonProcess {
     }
 }
 
-/// Check if a process with the given PID is alive. Pure Rust, no libc.
+/// Check if a process with the given PID is alive.
 ///
-/// Uses `/proc/{pid}` on Linux, `ps -p` on macOS/other.
-fn process_alive(pid: u32) -> bool {
+/// Uses `/proc/{pid}` on Linux, falls back to `ps -p` on macOS/other Unix.
+pub(crate) fn process_alive(pid: u32) -> bool {
     // Try /proc first (Linux)
     let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
     if proc_path.exists() {
