@@ -87,12 +87,7 @@ impl HealthCheck {
 
 impl fmt::Display for HealthCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = match &self.status {
-            HealthStatus::Healthy => "healthy".to_string(),
-            HealthStatus::Degraded(r) => format!("degraded: {r}"),
-            HealthStatus::Unhealthy(r) => format!("unhealthy: {r}"),
-        };
-        write!(f, "{} v{} — {}", self.service, self.version, status)?;
+        write!(f, "{} v{} — {}", self.service, self.version, self.status)?;
         if let Some(uptime) = self.uptime_secs {
             write!(f, " (uptime: {uptime}s)")?;
         }
