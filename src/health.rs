@@ -205,6 +205,14 @@ impl FromStr for HealthStatus {
     }
 }
 
+impl TryFrom<&str> for HealthStatus {
+    type Error = ParseHealthStatusError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +699,17 @@ mod tests {
             "bad".parse::<HealthStatus>().unwrap_err(),
         );
         assert!(err.to_string().contains("bad"));
+    }
+
+    #[test]
+    fn try_from_str_healthy() {
+        let status = HealthStatus::try_from("healthy").unwrap();
+        assert_eq!(status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn try_from_str_rejects_garbage() {
+        assert!(HealthStatus::try_from("nope").is_err());
     }
 
     #[test]
