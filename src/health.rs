@@ -82,6 +82,11 @@ impl HealthCheck {
         matches!(self.status, HealthStatus::Unhealthy(_))
     }
 
+    /// Deserialize from a JSON string.
+    pub fn from_json(json: &str) -> Result<Self, crate::TsunaguError> {
+        Ok(serde_json::from_str(json)?)
+    }
+
     /// Serialize to a pretty-printed JSON string.
     #[must_use = "serialization may fail; handle the error"]
     pub fn to_json(&self) -> Result<String, crate::TsunaguError> {
@@ -717,6 +722,26 @@ mod tests {
             .status(HealthStatus::Unhealthy("crash".into()))
             .build();
         assert!(hc.is_unhealthy());
+    }
+
+    #[test]
+    fn from_json_roundtrip() {
+        let original = HealthCheck::healthy("svc", "1.0").with_uptime(42);
+        let json = original.to_json().unwrap();
+        let restored = HealthCheck::from_json(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn from_json_rejects_garbage() {
+        let result = HealthCheck::from_json("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_json_returns_tsunagu_error() {
+        let err = HealthCheck::from_json("{bad}").unwrap_err();
+        assert!(err.to_string().contains("serialization error"));
     }
 
     #[test]
