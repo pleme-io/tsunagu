@@ -27,5 +27,8 @@ pub mod socket;
 
 pub use daemon::{DaemonProcess, ProcessChecker, SystemProcessChecker};
 pub use error::TsunaguError;
-pub use health::{HealthCheck, HealthCheckBuilder, HealthStatus, ParseHealthStatusError};
+pub use health::{
+    HealthCheck, HealthCheckBuilder, HealthChecker, HealthStatus, ParseHealthStatusError,
+    SimpleHealthChecker,
+};
 pub use socket::SocketPath;

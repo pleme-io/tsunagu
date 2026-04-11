@@ -1,5 +1,121 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Trait for pluggable health check implementations.
+///
+/// Services implement this to provide custom health semantics.
+/// The default [`SimpleHealthChecker`] reports a fixed status that can be
+/// toggled at runtime via atomic state.
+///
+/// # Example
+///
+/// ```
+/// use tsunagu::{HealthChecker, SimpleHealthChecker, HealthStatus};
+///
+/// let checker = SimpleHealthChecker::new("myapp", "0.1.0");
+/// assert!(checker.check().is_healthy());
+///
+/// // Use as trait object
+/// let boxed: Box<dyn HealthChecker> = Box::new(checker);
+/// assert_eq!(boxed.service_name(), "myapp");
+/// ```
+pub trait HealthChecker: Send + Sync {
+    /// Perform a health check and return the current status.
+    fn check(&self) -> HealthStatus;
+
+    /// Service name for reporting.
+    fn service_name(&self) -> &str;
+
+    /// Service version for reporting.
+    fn version(&self) -> &str;
+}
+
+/// Basic health checker that reports a fixed status.
+///
+/// The status can be toggled at runtime via [`set_healthy`](Self::set_healthy),
+/// [`set_degraded`](Self::set_degraded), and [`set_unhealthy`](Self::set_unhealthy).
+/// Status is stored as an atomic u8 (0 = healthy, 1 = degraded, 2 = unhealthy)
+/// so reads and writes are lock-free.
+///
+/// # Example
+///
+/// ```
+/// use tsunagu::{HealthChecker, SimpleHealthChecker};
+///
+/// let checker = SimpleHealthChecker::new("svc", "1.0");
+/// assert!(checker.check().is_healthy());
+///
+/// checker.set_degraded();
+/// assert!(checker.check().is_degraded());
+/// ```
+pub struct SimpleHealthChecker {
+    service: String,
+    version: String,
+    status: AtomicU8,
+}
+
+impl SimpleHealthChecker {
+    /// Healthy state constant.
+    const HEALTHY: u8 = 0;
+    /// Degraded state constant.
+    const DEGRADED: u8 = 1;
+    /// Unhealthy state constant.
+    const UNHEALTHY: u8 = 2;
+
+    /// Create a new checker that starts in the [`HealthStatus::Healthy`] state.
+    #[must_use]
+    pub fn new(service: &str, version: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            version: version.to_string(),
+            status: AtomicU8::new(Self::HEALTHY),
+        }
+    }
+
+    /// Set the status to [`HealthStatus::Healthy`].
+    pub fn set_healthy(&self) {
+        self.status.store(Self::HEALTHY, Ordering::Relaxed);
+    }
+
+    /// Set the status to [`HealthStatus::Degraded`].
+    pub fn set_degraded(&self) {
+        self.status.store(Self::DEGRADED, Ordering::Relaxed);
+    }
+
+    /// Set the status to [`HealthStatus::Unhealthy`].
+    pub fn set_unhealthy(&self) {
+        self.status.store(Self::UNHEALTHY, Ordering::Relaxed);
+    }
+}
+
+impl HealthChecker for SimpleHealthChecker {
+    fn check(&self) -> HealthStatus {
+        match self.status.load(Ordering::Relaxed) {
+            Self::DEGRADED => HealthStatus::Degraded("degraded".to_string()),
+            Self::UNHEALTHY => HealthStatus::Unhealthy("unhealthy".to_string()),
+            _ => HealthStatus::Healthy,
+        }
+    }
+
+    fn service_name(&self) -> &str {
+        &self.service
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+impl fmt::Debug for SimpleHealthChecker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimpleHealthChecker")
+            .field("service", &self.service)
+            .field("version", &self.version)
+            .field("status", &self.status.load(Ordering::Relaxed))
+            .finish()
+    }
+}
 
 /// Health status for a daemon service.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -857,5 +973,165 @@ mod tests {
         assert!(hc2.is_unhealthy());
         assert_eq!(hc1.uptime_secs, Some(10));
         assert_eq!(hc2.uptime_secs, Some(10));
+    }
+
+    // ----------------------------------------------------------------
+    // HealthChecker trait + SimpleHealthChecker
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn simple_checker_starts_healthy() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        assert!(checker.check().is_healthy());
+    }
+
+    #[test]
+    fn simple_checker_service_name() {
+        let checker = SimpleHealthChecker::new("myapp", "2.0");
+        assert_eq!(checker.service_name(), "myapp");
+    }
+
+    #[test]
+    fn simple_checker_version() {
+        let checker = SimpleHealthChecker::new("myapp", "2.0");
+        assert_eq!(checker.version(), "2.0");
+    }
+
+    #[test]
+    fn simple_checker_set_degraded() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        checker.set_degraded();
+        assert!(checker.check().is_degraded());
+    }
+
+    #[test]
+    fn simple_checker_set_unhealthy() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        checker.set_unhealthy();
+        assert!(checker.check().is_unhealthy());
+    }
+
+    #[test]
+    fn simple_checker_set_healthy_after_unhealthy() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        checker.set_unhealthy();
+        assert!(checker.check().is_unhealthy());
+        checker.set_healthy();
+        assert!(checker.check().is_healthy());
+    }
+
+    #[test]
+    fn simple_checker_set_healthy_after_degraded() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        checker.set_degraded();
+        assert!(checker.check().is_degraded());
+        checker.set_healthy();
+        assert!(checker.check().is_healthy());
+    }
+
+    #[test]
+    fn simple_checker_cycle_all_states() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        assert!(checker.check().is_healthy());
+        checker.set_degraded();
+        assert!(checker.check().is_degraded());
+        checker.set_unhealthy();
+        assert!(checker.check().is_unhealthy());
+        checker.set_healthy();
+        assert!(checker.check().is_healthy());
+    }
+
+    #[test]
+    fn simple_checker_debug_format() {
+        let checker = SimpleHealthChecker::new("svc", "1.0");
+        let debug = format!("{checker:?}");
+        assert!(debug.contains("SimpleHealthChecker"));
+        assert!(debug.contains("svc"));
+    }
+
+    #[test]
+    fn health_checker_as_trait_object() {
+        let checker: Box<dyn HealthChecker> = Box::new(SimpleHealthChecker::new("svc", "1.0"));
+        assert!(checker.check().is_healthy());
+        assert_eq!(checker.service_name(), "svc");
+        assert_eq!(checker.version(), "1.0");
+    }
+
+    #[test]
+    fn health_checker_trait_object_degraded() {
+        let simple = SimpleHealthChecker::new("svc", "1.0");
+        simple.set_degraded();
+        let checker: Box<dyn HealthChecker> = Box::new(simple);
+        assert!(checker.check().is_degraded());
+    }
+
+    #[test]
+    fn health_checker_trait_object_unhealthy() {
+        let simple = SimpleHealthChecker::new("svc", "1.0");
+        simple.set_unhealthy();
+        let checker: Box<dyn HealthChecker> = Box::new(simple);
+        assert!(checker.check().is_unhealthy());
+    }
+
+    #[test]
+    fn health_checker_trait_object_dispatch() {
+        // Verify dynamic dispatch works with multiple implementations
+        struct AlwaysDegraded;
+        impl HealthChecker for AlwaysDegraded {
+            fn check(&self) -> HealthStatus {
+                HealthStatus::Degraded("always".to_string())
+            }
+            fn service_name(&self) -> &str { "degraded-svc" }
+            fn version(&self) -> &str { "0.0.1" }
+        }
+
+        let checkers: Vec<Box<dyn HealthChecker>> = vec![
+            Box::new(SimpleHealthChecker::new("simple", "1.0")),
+            Box::new(AlwaysDegraded),
+        ];
+
+        assert!(checkers[0].check().is_healthy());
+        assert!(checkers[1].check().is_degraded());
+        assert_eq!(checkers[0].service_name(), "simple");
+        assert_eq!(checkers[1].service_name(), "degraded-svc");
+    }
+
+    #[test]
+    fn process_checker_trait_object_dispatch() {
+        use crate::daemon::ProcessChecker;
+
+        struct AlwaysAlive;
+        impl ProcessChecker for AlwaysAlive {
+            fn is_alive(&self, _pid: u32) -> bool { true }
+        }
+
+        struct NeverAlive;
+        impl ProcessChecker for NeverAlive {
+            fn is_alive(&self, _pid: u32) -> bool { false }
+        }
+
+        let checkers: Vec<Box<dyn ProcessChecker>> = vec![
+            Box::new(AlwaysAlive),
+            Box::new(NeverAlive),
+        ];
+
+        assert!(checkers[0].is_alive(1));
+        assert!(!checkers[1].is_alive(1));
+    }
+
+    #[test]
+    fn simple_checker_unicode_names() {
+        let checker = SimpleHealthChecker::new("繋ぐ", "0.1.0");
+        assert_eq!(checker.service_name(), "繋ぐ");
+        assert_eq!(checker.version(), "0.1.0");
+        assert!(checker.check().is_healthy());
+    }
+
+    #[test]
+    fn simple_checker_empty_names() {
+        let checker = SimpleHealthChecker::new("", "");
+        assert_eq!(checker.service_name(), "");
+        assert_eq!(checker.version(), "");
+        assert!(checker.check().is_healthy());
     }
 }
