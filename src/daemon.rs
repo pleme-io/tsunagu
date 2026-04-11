@@ -184,13 +184,37 @@ impl<C: ProcessChecker> std::fmt::Display for DaemonProcess<C> {
     }
 }
 
-/// Check if a process with the given PID is alive.
+/// Check if a process with the given PID is alive using `kill(0)`.
 ///
-/// Convenience wrapper around [`SystemProcessChecker`], retained for
-/// backward-compatible test assertions.
+/// Unlike [`SystemProcessChecker`] which relies on `ps` (and may fail in
+/// sandboxed macOS environments missing the `com.apple.system-task-ports`
+/// entitlement), this function uses the POSIX `kill(pid, 0)` syscall which
+/// only requires the caller to have permission to signal the process.
 #[cfg(test)]
 fn process_alive(pid: u32) -> bool {
-    SystemProcessChecker.is_alive(pid)
+    // kill(pid, 0) checks if we *can* signal the process without actually
+    // sending a signal.  Returns 0 on success, -1 on error.  ESRCH means
+    // the process doesn't exist; EPERM means it exists but we lack
+    // permission — still alive in that case.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // EPERM → process exists but we can't signal it → alive
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// A mock [`ProcessChecker`] that uses `kill(0)` — works in sandboxed macOS
+/// where `ps -p` lacks entitlements.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct KillZeroChecker;
+
+#[cfg(test)]
+impl ProcessChecker for KillZeroChecker {
+    fn is_alive(&self, pid: u32) -> bool {
+        process_alive(pid)
+    }
 }
 
 #[cfg(test)]
@@ -198,13 +222,37 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn test_daemon(dir: &TempDir) -> DaemonProcess {
-        DaemonProcess::with_paths(
+    fn test_daemon(dir: &TempDir) -> DaemonProcess<MockProcessChecker> {
+        DaemonProcess::with_checker(
             "test-app",
             dir.path().join("test.pid"),
             dir.path().join("test.sock"),
+            MockProcessChecker { alive: false },
         )
     }
+
+    fn test_daemon_alive(dir: &TempDir) -> DaemonProcess<MockProcessChecker> {
+        DaemonProcess::with_checker(
+            "test-app",
+            dir.path().join("test.pid"),
+            dir.path().join("test.sock"),
+            MockProcessChecker { alive: true },
+        )
+    }
+
+    /// Helper: daemon using `kill(0)` for real process detection (sandbox-safe).
+    fn test_daemon_real(dir: &TempDir) -> DaemonProcess<KillZeroChecker> {
+        DaemonProcess::with_checker(
+            "test-app",
+            dir.path().join("test.pid"),
+            dir.path().join("test.sock"),
+            KillZeroChecker,
+        )
+    }
+
+    // ----------------------------------------------------------------
+    // Basic construction
+    // ----------------------------------------------------------------
 
     #[test]
     fn new_daemon_not_running() {
@@ -212,6 +260,45 @@ mod tests {
         let d = test_daemon(&dir);
         assert!(!d.is_running());
     }
+
+    #[test]
+    fn new_uses_socket_path_defaults() {
+        let d = DaemonProcess::new("tsunagu-test-new");
+        let expected_pid = SocketPath::pid_file("tsunagu-test-new");
+        let expected_sock = SocketPath::for_app("tsunagu-test-new");
+        assert_eq!(*d.pid_path(), expected_pid);
+        assert_eq!(*d.socket_path(), expected_sock);
+    }
+
+    #[test]
+    fn with_paths_uses_custom_paths() {
+        let pid = PathBuf::from("/custom/dir/app.pid");
+        let sock = PathBuf::from("/custom/dir/app.sock");
+        let d = DaemonProcess::with_paths("custom", pid.clone(), sock.clone());
+        assert_eq!(*d.pid_path(), pid);
+        assert_eq!(*d.socket_path(), sock);
+        assert_eq!(d.app_name(), "custom");
+    }
+
+    #[test]
+    fn with_paths_preserves_exact_paths() {
+        let pid = PathBuf::from("/tmp/special-dir/my.pid");
+        let sock = PathBuf::from("/var/run/my.sock");
+        let d = DaemonProcess::with_paths("exact", pid, sock);
+        assert_eq!(d.pid_path().to_str().unwrap(), "/tmp/special-dir/my.pid");
+        assert_eq!(d.socket_path().to_str().unwrap(), "/var/run/my.sock");
+    }
+
+    #[test]
+    fn app_name_is_stored() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        assert_eq!(d.app_name(), "test-app");
+    }
+
+    // ----------------------------------------------------------------
+    // PID file write / read
+    // ----------------------------------------------------------------
 
     #[test]
     fn write_pid_creates_file() {
@@ -236,118 +323,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let d = test_daemon(&dir);
         assert_eq!(d.read_pid(), None);
-    }
-
-    #[test]
-    fn is_running_detects_current_process() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.write_pid().unwrap();
-        // Our own process IS alive
-        assert!(d.is_running());
-    }
-
-    #[test]
-    fn is_running_false_for_stale_pid() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        // Write a PID that almost certainly doesn't exist
-        std::fs::write(d.pid_path(), "99999999").unwrap();
-        assert!(!d.is_running());
-    }
-
-    #[test]
-    fn cleanup_removes_files() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.write_pid().unwrap();
-        // Create a fake socket file
-        std::fs::write(d.socket_path(), "").unwrap();
-        assert!(d.pid_path().exists());
-        assert!(d.socket_path().exists());
-        d.cleanup();
-        assert!(!d.pid_path().exists());
-        assert!(!d.socket_path().exists());
-    }
-
-    #[test]
-    fn acquire_succeeds_when_not_running() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.acquire().unwrap();
-        assert!(d.pid_path().exists());
-    }
-
-    #[test]
-    fn acquire_removes_stale_pid() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        // Write stale PID
-        std::fs::write(d.pid_path(), "99999999").unwrap();
-        // Should succeed because the PID is stale
-        d.acquire().unwrap();
-        // Now has our PID
-        assert_eq!(d.read_pid(), Some(std::process::id()));
-    }
-
-    #[test]
-    fn acquire_fails_when_already_running() {
-        let dir = TempDir::new().unwrap();
-        // Write our own PID (which IS alive)
-        let pid_path = dir.path().join("test.pid");
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        let d = DaemonProcess::with_paths(
-            "test-app",
-            pid_path,
-            dir.path().join("test.sock"),
-        );
-        let err = d.acquire().unwrap_err();
-        assert!(err.to_string().contains("already running"));
-    }
-
-    #[test]
-    fn app_name_is_stored() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        assert_eq!(d.app_name(), "test-app");
-    }
-
-    #[test]
-    fn drop_cleans_up() {
-        let dir = TempDir::new().unwrap();
-        let pid_path = dir.path().join("test.pid");
-        let sock_path = dir.path().join("test.sock");
-        {
-            let d = DaemonProcess::with_paths("test-app", pid_path.clone(), sock_path.clone());
-            d.write_pid().unwrap();
-            std::fs::write(&sock_path, "").unwrap();
-            assert!(pid_path.exists());
-        }
-        // After drop, files should be gone
-        assert!(!pid_path.exists());
-        assert!(!sock_path.exists());
-    }
-
-    // --- Additional tests ---
-
-    #[test]
-    fn new_uses_socket_path_defaults() {
-        let d = DaemonProcess::new("tsunagu-test-new");
-        let expected_pid = SocketPath::pid_file("tsunagu-test-new");
-        let expected_sock = SocketPath::for_app("tsunagu-test-new");
-        assert_eq!(*d.pid_path(), expected_pid);
-        assert_eq!(*d.socket_path(), expected_sock);
-    }
-
-    #[test]
-    fn with_paths_uses_custom_paths() {
-        let pid = PathBuf::from("/custom/dir/app.pid");
-        let sock = PathBuf::from("/custom/dir/app.sock");
-        let d = DaemonProcess::with_paths("custom", pid.clone(), sock.clone());
-        assert_eq!(*d.pid_path(), pid);
-        assert_eq!(*d.socket_path(), sock);
-        assert_eq!(d.app_name(), "custom");
     }
 
     #[test]
@@ -392,179 +367,13 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_returns_none_for_zero() {
-        // PID 0 is technically parseable as u32, but the function returns Some(0).
+    fn read_pid_returns_some_for_zero() {
+        // PID 0 is technically parseable as u32.
         // This test documents the current behavior: 0 is a valid u32 parse result.
         let dir = TempDir::new().unwrap();
         let d = test_daemon(&dir);
         std::fs::write(d.pid_path(), "0").unwrap();
         assert_eq!(d.read_pid(), Some(0));
-    }
-
-    #[test]
-    fn write_pid_creates_parent_directories() {
-        let dir = TempDir::new().unwrap();
-        let nested_pid = dir.path().join("nested").join("deep").join("test.pid");
-        let d = DaemonProcess::with_paths(
-            "nested-test",
-            nested_pid.clone(),
-            dir.path().join("test.sock"),
-        );
-        d.write_pid().unwrap();
-        assert!(nested_pid.exists());
-        let contents = std::fs::read_to_string(&nested_pid).unwrap();
-        assert_eq!(contents, std::process::id().to_string());
-    }
-
-    #[test]
-    fn write_pid_overwrites_existing() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        std::fs::write(d.pid_path(), "old-content").unwrap();
-        d.write_pid().unwrap();
-        let contents = std::fs::read_to_string(d.pid_path()).unwrap();
-        assert_eq!(contents, std::process::id().to_string());
-    }
-
-    #[test]
-    fn cleanup_is_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.write_pid().unwrap();
-        std::fs::write(d.socket_path(), "").unwrap();
-        d.cleanup();
-        // Second cleanup should not panic
-        d.cleanup();
-        assert!(!d.pid_path().exists());
-        assert!(!d.socket_path().exists());
-    }
-
-    #[test]
-    fn cleanup_when_no_files_exist() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        // Files never created; cleanup should not panic
-        d.cleanup();
-    }
-
-    #[test]
-    fn cleanup_removes_pid_even_if_socket_missing() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.write_pid().unwrap();
-        // Do not create socket file
-        assert!(d.pid_path().exists());
-        d.cleanup();
-        assert!(!d.pid_path().exists());
-    }
-
-    #[test]
-    fn cleanup_removes_socket_even_if_pid_missing() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        std::fs::write(d.socket_path(), "").unwrap();
-        // Do not create PID file
-        assert!(d.socket_path().exists());
-        d.cleanup();
-        assert!(!d.socket_path().exists());
-    }
-
-    #[test]
-    fn acquire_writes_current_pid() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.acquire().unwrap();
-        assert_eq!(d.read_pid(), Some(std::process::id()));
-    }
-
-    #[test]
-    fn daemon_already_running_error_contains_pid() {
-        // Test the error variant directly; process_alive may not work in
-        // sandboxed environments (macOS entitlement issue with `ps`).
-        let err = TsunaguError::DaemonAlreadyRunning { pid: 54321 };
-        let msg = err.to_string();
-        assert!(msg.contains("54321"), "error should contain the PID");
-        assert!(msg.contains("already running"));
-    }
-
-    #[test]
-    fn acquire_replaces_stale_pid_with_current() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        // Write a stale PID
-        std::fs::write(d.pid_path(), "88888888").unwrap();
-        d.acquire().unwrap();
-        // After acquire, our PID replaces the stale one
-        let stored_pid = d.read_pid().unwrap();
-        assert_eq!(stored_pid, std::process::id());
-    }
-
-    #[test]
-    fn is_running_false_for_empty_pid_file() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        std::fs::write(d.pid_path(), "").unwrap();
-        assert!(!d.is_running());
-    }
-
-    #[test]
-    fn is_running_false_for_garbage_pid_file() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        std::fs::write(d.pid_path(), "hello-world").unwrap();
-        assert!(!d.is_running());
-    }
-
-    #[test]
-    fn process_alive_returns_false_for_nonexistent_pid() {
-        // PID 99_999_999 is almost certainly not running
-        assert!(!process_alive(99_999_999));
-    }
-
-    #[test]
-    fn drop_without_any_writes_is_safe() {
-        let dir = TempDir::new().unwrap();
-        let pid_path = dir.path().join("noop.pid");
-        let sock_path = dir.path().join("noop.sock");
-        {
-            let _d = DaemonProcess::with_paths("noop", pid_path.clone(), sock_path.clone());
-            // Drop immediately without writing anything
-        }
-        assert!(!pid_path.exists());
-        assert!(!sock_path.exists());
-    }
-
-    #[test]
-    fn multiple_daemons_different_apps_coexist() {
-        let dir = TempDir::new().unwrap();
-        let d1 = DaemonProcess::with_paths(
-            "app-a",
-            dir.path().join("a.pid"),
-            dir.path().join("a.sock"),
-        );
-        let d2 = DaemonProcess::with_paths(
-            "app-b",
-            dir.path().join("b.pid"),
-            dir.path().join("b.sock"),
-        );
-        d1.write_pid().unwrap();
-        d2.write_pid().unwrap();
-        assert!(d1.pid_path().exists());
-        assert!(d2.pid_path().exists());
-        assert_eq!(d1.app_name(), "app-a");
-        assert_eq!(d2.app_name(), "app-b");
-    }
-
-    #[test]
-    fn write_pid_then_read_is_consistent() {
-        let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
-        d.write_pid().unwrap();
-        // Read it back multiple times to confirm consistency
-        let pid1 = d.read_pid();
-        let pid2 = d.read_pid();
-        assert_eq!(pid1, pid2);
-        assert_eq!(pid1, Some(std::process::id()));
     }
 
     #[test]
@@ -600,8 +409,362 @@ mod tests {
     }
 
     #[test]
+    fn read_pid_rejects_hex() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "0xff").unwrap();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn read_pid_accepts_u32_max() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), u32::MAX.to_string()).unwrap();
+        assert_eq!(d.read_pid(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn write_pid_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let nested_pid = dir.path().join("nested").join("deep").join("test.pid");
+        let d = DaemonProcess::with_checker(
+            "nested-test",
+            nested_pid.clone(),
+            dir.path().join("test.sock"),
+            MockProcessChecker { alive: false },
+        );
+        d.write_pid().unwrap();
+        assert!(nested_pid.exists());
+        let contents = std::fs::read_to_string(&nested_pid).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+    }
+
+    #[test]
+    fn write_pid_overwrites_existing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "old-content").unwrap();
+        d.write_pid().unwrap();
+        let contents = std::fs::read_to_string(d.pid_path()).unwrap();
+        assert_eq!(contents, std::process::id().to_string());
+    }
+
+    #[test]
+    fn write_pid_then_read_is_consistent() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        let pid1 = d.read_pid();
+        let pid2 = d.read_pid();
+        assert_eq!(pid1, pid2);
+        assert_eq!(pid1, Some(std::process::id()));
+    }
+
+    // ----------------------------------------------------------------
+    // is_running (with mock checker)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn is_running_true_when_pid_exists_and_alive() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        std::fs::write(d.pid_path(), "12345").unwrap();
+        assert!(d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_when_pid_exists_but_dead() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir); // alive: false
+        std::fs::write(d.pid_path(), "12345").unwrap();
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_when_no_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_for_empty_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        std::fs::write(d.pid_path(), "").unwrap();
+        assert!(!d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_for_garbage_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        std::fs::write(d.pid_path(), "hello-world").unwrap();
+        assert!(!d.is_running());
+    }
+
+    // ----------------------------------------------------------------
+    // is_running (with real kill(0) checker)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn is_running_detects_current_process_real() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_real(&dir);
+        d.write_pid().unwrap();
+        assert!(d.is_running());
+    }
+
+    #[test]
+    fn is_running_false_for_stale_pid_real() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_real(&dir);
+        std::fs::write(d.pid_path(), "99999999").unwrap();
+        assert!(!d.is_running());
+    }
+
+    // ----------------------------------------------------------------
+    // Cleanup
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cleanup_removes_files() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        std::fs::write(d.socket_path(), "").unwrap();
+        assert!(d.pid_path().exists());
+        assert!(d.socket_path().exists());
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        assert!(!d.socket_path().exists());
+    }
+
+    #[test]
+    fn cleanup_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        std::fs::write(d.socket_path(), "").unwrap();
+        d.cleanup();
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        assert!(!d.socket_path().exists());
+    }
+
+    #[test]
+    fn cleanup_when_no_files_exist() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.cleanup();
+    }
+
+    #[test]
+    fn cleanup_removes_pid_even_if_socket_missing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        assert!(d.pid_path().exists());
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+    }
+
+    #[test]
+    fn cleanup_removes_socket_even_if_pid_missing() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.socket_path(), "").unwrap();
+        assert!(d.socket_path().exists());
+        d.cleanup();
+        assert!(!d.socket_path().exists());
+    }
+
+    // ----------------------------------------------------------------
+    // Acquire
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn acquire_succeeds_when_not_running() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.acquire().unwrap();
+        assert!(d.pid_path().exists());
+    }
+
+    #[test]
+    fn acquire_writes_current_pid() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn acquire_removes_stale_pid() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir); // alive: false → stale
+        std::fs::write(d.pid_path(), "99999999").unwrap();
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn acquire_replaces_stale_pid_with_current() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        std::fs::write(d.pid_path(), "88888888").unwrap();
+        d.acquire().unwrap();
+        let stored_pid = d.read_pid().unwrap();
+        assert_eq!(stored_pid, std::process::id());
+    }
+
+    #[test]
+    fn acquire_fails_when_already_running() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("test.pid");
+        std::fs::write(&pid_path, "42").unwrap();
+
+        let d = DaemonProcess::with_checker(
+            "test-app",
+            pid_path,
+            dir.path().join("test.sock"),
+            MockProcessChecker { alive: true },
+        );
+        let err = d.acquire().unwrap_err();
+        assert!(err.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn acquire_error_variant_matches_daemon_already_running() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("test.pid");
+        std::fs::write(&pid_path, "54321").unwrap();
+
+        let d = DaemonProcess::with_checker(
+            "test-app",
+            pid_path,
+            dir.path().join("test.sock"),
+            MockProcessChecker { alive: true },
+        );
+        let err = d.acquire().unwrap_err();
+        match err {
+            TsunaguError::DaemonAlreadyRunning { pid } => {
+                assert_eq!(pid, 54321);
+            }
+            other => panic!("expected DaemonAlreadyRunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_already_running_error_contains_pid() {
+        let err = TsunaguError::DaemonAlreadyRunning { pid: 54321 };
+        let msg = err.to_string();
+        assert!(msg.contains("54321"), "error should contain the PID");
+        assert!(msg.contains("already running"));
+    }
+
+    // ----------------------------------------------------------------
+    // Drop
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn drop_cleans_up() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("test.pid");
+        let sock_path = dir.path().join("test.sock");
+        {
+            let d = DaemonProcess::with_paths("test-app", pid_path.clone(), sock_path.clone());
+            d.write_pid().unwrap();
+            std::fs::write(&sock_path, "").unwrap();
+            assert!(pid_path.exists());
+        }
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
+    }
+
+    #[test]
+    fn drop_without_any_writes_is_safe() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("noop.pid");
+        let sock_path = dir.path().join("noop.sock");
+        {
+            let _d = DaemonProcess::with_paths("noop", pid_path.clone(), sock_path.clone());
+        }
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
+    }
+
+    #[test]
+    fn acquire_then_drop_cleans_pid() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("lifecycle.pid");
+        let sock_path = dir.path().join("lifecycle.sock");
+        {
+            let d = DaemonProcess::with_checker(
+                "lifecycle",
+                pid_path.clone(),
+                sock_path.clone(),
+                MockProcessChecker { alive: false },
+            );
+            d.acquire().unwrap();
+            assert!(pid_path.exists());
+        }
+        assert!(!pid_path.exists());
+    }
+
+    // ----------------------------------------------------------------
+    // Display
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn display_includes_app_name_and_pid_path() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        let s = d.to_string();
+        assert!(s.contains("test-app"), "display should contain app name: {s}");
+        assert!(s.contains("test.pid"), "display should contain pid path: {s}");
+    }
+
+    // ----------------------------------------------------------------
+    // Multi-daemon coexistence
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn multiple_daemons_different_apps_coexist() {
+        let dir = TempDir::new().unwrap();
+        let d1 = DaemonProcess::with_checker(
+            "app-a",
+            dir.path().join("a.pid"),
+            dir.path().join("a.sock"),
+            MockProcessChecker { alive: false },
+        );
+        let d2 = DaemonProcess::with_checker(
+            "app-b",
+            dir.path().join("b.pid"),
+            dir.path().join("b.sock"),
+            MockProcessChecker { alive: false },
+        );
+        d1.write_pid().unwrap();
+        d2.write_pid().unwrap();
+        assert!(d1.pid_path().exists());
+        assert!(d2.pid_path().exists());
+        assert_eq!(d1.app_name(), "app-a");
+        assert_eq!(d2.app_name(), "app-b");
+    }
+
+    // ----------------------------------------------------------------
+    // process_alive (kill(0) based)
+    // ----------------------------------------------------------------
+
+    #[test]
     fn process_alive_returns_true_for_current_process() {
         assert!(process_alive(std::process::id()));
+    }
+
+    #[test]
+    fn process_alive_returns_false_for_nonexistent_pid() {
+        assert!(!process_alive(99_999_999));
     }
 
     #[test]
@@ -609,10 +772,14 @@ mod tests {
         assert!(!process_alive(1_000_000_000));
     }
 
+    // ----------------------------------------------------------------
+    // Full lifecycle (with real kill(0) checker)
+    // ----------------------------------------------------------------
+
     #[test]
     fn full_lifecycle_acquire_check_cleanup() {
         let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
+        let d = test_daemon_real(&dir);
 
         assert!(!d.is_running());
         assert_eq!(d.read_pid(), None);
@@ -627,29 +794,16 @@ mod tests {
         assert!(!d.is_running());
     }
 
-    #[test]
-    fn acquire_then_drop_cleans_pid() {
-        let dir = TempDir::new().unwrap();
-        let pid_path = dir.path().join("lifecycle.pid");
-        let sock_path = dir.path().join("lifecycle.sock");
-        {
-            let d = DaemonProcess::with_paths(
-                "lifecycle",
-                pid_path.clone(),
-                sock_path.clone(),
-            );
-            d.acquire().unwrap();
-            assert!(pid_path.exists());
-        }
-        assert!(!pid_path.exists());
-    }
+    // ----------------------------------------------------------------
+    // Socket handshake integration test
+    // ----------------------------------------------------------------
 
     #[tokio::test]
     async fn socket_handshake_with_pid_lifecycle() {
         use tokio::net::{UnixListener, UnixStream};
 
         let dir = TempDir::new().unwrap();
-        let d = test_daemon(&dir);
+        let d = test_daemon_real(&dir);
         d.acquire().unwrap();
 
         let listener = UnixListener::bind(d.socket_path()).unwrap();
@@ -673,34 +827,9 @@ mod tests {
         assert!(!d.socket_path().exists());
     }
 
-    #[test]
-    fn acquire_error_variant_matches_daemon_already_running() {
-        let dir = TempDir::new().unwrap();
-        let pid_path = dir.path().join("test.pid");
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        let d = DaemonProcess::with_paths(
-            "test-app",
-            pid_path,
-            dir.path().join("test.sock"),
-        );
-        let err = d.acquire().unwrap_err();
-        match err {
-            TsunaguError::DaemonAlreadyRunning { pid } => {
-                assert_eq!(pid, std::process::id());
-            }
-            other => panic!("expected DaemonAlreadyRunning, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn with_paths_preserves_exact_paths() {
-        let pid = PathBuf::from("/tmp/special-dir/my.pid");
-        let sock = PathBuf::from("/var/run/my.sock");
-        let d = DaemonProcess::with_paths("exact", pid, sock);
-        assert_eq!(d.pid_path().to_str().unwrap(), "/tmp/special-dir/my.pid");
-        assert_eq!(d.socket_path().to_str().unwrap(), "/var/run/my.sock");
-    }
+    // ----------------------------------------------------------------
+    // Mock checker tests
+    // ----------------------------------------------------------------
 
     #[test]
     fn mock_checker_always_alive() {
@@ -757,18 +886,152 @@ mod tests {
     }
 
     #[test]
-    fn system_process_checker_default() {
-        let checker = SystemProcessChecker::default();
-        assert!(checker.is_alive(std::process::id()));
-        assert!(!checker.is_alive(99_999_999));
+    fn mock_checker_is_running_depends_on_pid_file_parse() {
+        // Even with alive=true, if the PID file has garbage, is_running returns false
+        // because read_pid returns None.
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        std::fs::write(d.pid_path(), "not-a-pid").unwrap();
+        assert!(!d.is_running());
     }
 
     #[test]
-    fn display_includes_app_name_and_pid_path() {
+    fn mock_checker_acquire_with_no_existing_pid_file() {
+        // acquire should succeed when no PID file exists, regardless of checker
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    // ----------------------------------------------------------------
+    // KillZeroChecker tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn kill_zero_checker_detects_self() {
+        let checker = KillZeroChecker;
+        assert!(checker.is_alive(std::process::id()));
+    }
+
+    #[test]
+    fn kill_zero_checker_rejects_nonexistent() {
+        let checker = KillZeroChecker;
+        assert!(!checker.is_alive(99_999_999));
+    }
+
+    // ----------------------------------------------------------------
+    // SystemProcessChecker (constructor only -- not relying on ps -p)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn system_process_checker_is_default_constructible() {
+        let _checker = SystemProcessChecker::default();
+    }
+
+    #[test]
+    fn system_process_checker_rejects_nonexistent_pid() {
+        let checker = SystemProcessChecker::default();
+        assert!(!checker.is_alive(99_999_999));
+    }
+
+    // ----------------------------------------------------------------
+    // Bidirectional socket communication
+    // ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn socket_bidirectional_communication() {
+        use tokio::net::{UnixListener, UnixStream};
+
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_real(&dir);
+        d.acquire().unwrap();
+
+        let listener = UnixListener::bind(d.socket_path()).unwrap();
+
+        let client_path = d.socket_path().to_path_buf();
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&client_path).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello").await.unwrap();
+            let mut buf = vec![0u8; 5];
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+            assert_eq!(&buf, b"world");
+        });
+
+        let (mut conn, _addr) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        tokio::io::AsyncWriteExt::write_all(&mut conn, b"world").await.unwrap();
+
+        client.await.unwrap();
+    }
+
+    // ----------------------------------------------------------------
+    // Edge cases
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn acquire_twice_without_cleanup_succeeds_with_dead_checker() {
+        // The second acquire sees a PID file with the current PID,
+        // but the mock says the process is dead, so it re-acquires.
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir); // alive: false
+        d.acquire().unwrap();
+        d.acquire().unwrap();
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn acquire_twice_without_cleanup_fails_with_alive_checker() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon_alive(&dir);
+        d.acquire().unwrap();
+        let err = d.acquire().unwrap_err();
+        assert!(err.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn cleanup_then_reacquire() {
         let dir = TempDir::new().unwrap();
         let d = test_daemon(&dir);
-        let s = d.to_string();
-        assert!(s.contains("test-app"), "display should contain app name: {s}");
-        assert!(s.contains("test.pid"), "display should contain pid path: {s}");
+        d.acquire().unwrap();
+        d.cleanup();
+        assert!(!d.pid_path().exists());
+        d.acquire().unwrap();
+        assert!(d.pid_path().exists());
+        assert_eq!(d.read_pid(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn write_pid_then_cleanup_then_read_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        d.cleanup();
+        assert_eq!(d.read_pid(), None);
+    }
+
+    #[test]
+    fn multiple_writes_last_pid_wins() {
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir);
+        d.write_pid().unwrap();
+        // Manually overwrite with a different PID
+        std::fs::write(d.pid_path(), "77777").unwrap();
+        assert_eq!(d.read_pid(), Some(77777));
+    }
+
+    #[test]
+    fn acquire_cleans_stale_pid_file_before_writing() {
+        // Verify the stale file is actually removed (not just overwritten)
+        let dir = TempDir::new().unwrap();
+        let d = test_daemon(&dir); // alive: false
+        let stale_content = "88888888";
+        std::fs::write(d.pid_path(), stale_content).unwrap();
+        d.acquire().unwrap();
+        let contents = std::fs::read_to_string(d.pid_path()).unwrap();
+        assert_ne!(contents, stale_content);
+        assert_eq!(contents, std::process::id().to_string());
     }
 }

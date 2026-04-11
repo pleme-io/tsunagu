@@ -26,5 +26,6 @@ dirs = "6.0"
 tokio = { version = "1", features = ["rt", "net", "signal", "sync", "macros", "time", "io-util"] }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util", "macros"] }
