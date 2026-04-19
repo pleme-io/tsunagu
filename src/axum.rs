@@ -31,14 +31,13 @@
 //!     Arc::new(SimpleHealthChecker::new("myapp", "1.0.0"));
 //!
 //! let app = ::axum::Router::new()
-//!     .merge(health_router(checker));
+//!     .merge(health_router::<()>(checker));
 //! // app now serves GET /health, /readiness, /liveness
 //! # }
 //! ```
 
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -49,25 +48,72 @@ use crate::HealthCheck;
 
 /// Router with `/health`, `/readiness`, `/liveness` endpoints.
 ///
+/// Generic over the outer router's state `S` so consumers can `.merge()`
+/// this router into their app without state-type conflicts. The health
+/// checker is captured in each handler via closure; the outer state
+/// remains what the consumer already wired.
+///
 /// All three endpoints currently share the same handler — the distinction
 /// lives in K8s probe config (which endpoint to poll, at what interval).
-/// Daemons that need genuinely different semantics compose their own
-/// router with separate checkers.
-pub fn health_router(checker: Arc<dyn HealthChecker>) -> Router {
-    Router::new()
-        .route("/health", get(health_handler))
-        .route("/readiness", get(health_handler))
-        .route("/liveness", get(health_handler))
-        .with_state(checker)
+/// Daemons with genuinely different readiness vs liveness semantics
+/// compose their own router with separate checkers.
+///
+/// # Example
+///
+/// ```no_run
+/// # #[cfg(feature = "axum")]
+/// # {
+/// use std::sync::Arc;
+/// use tsunagu::{HealthChecker, SimpleHealthChecker};
+/// use tsunagu::axum::health_router;
+///
+/// #[derive(Clone)]
+/// struct AppState;
+///
+/// let checker: Arc<dyn HealthChecker> =
+///     Arc::new(SimpleHealthChecker::new("myapp", "1.0"));
+///
+/// let app: ::axum::Router<AppState> = ::axum::Router::<AppState>::new()
+///     .merge(health_router::<AppState>(checker))
+///     .with_state(AppState);
+/// # }
+/// ```
+pub fn health_router<S>(checker: Arc<dyn HealthChecker>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let c1 = checker.clone();
+    let c2 = checker.clone();
+    let c3 = checker;
+    Router::<S>::new()
+        .route(
+            "/health",
+            get(move || {
+                let c = c1.clone();
+                async move { health_response(c).await }
+            }),
+        )
+        .route(
+            "/readiness",
+            get(move || {
+                let c = c2.clone();
+                async move { health_response(c).await }
+            }),
+        )
+        .route(
+            "/liveness",
+            get(move || {
+                let c = c3.clone();
+                async move { health_response(c).await }
+            }),
+        )
 }
 
-/// Shared handler: serialize the HealthCheck, return 503 if Unhealthy else 200.
+/// Response-building helper — serialize HealthCheck, map Unhealthy → 503.
 ///
-/// `HealthStatus::Degraded` and `Unhealthy` carry reason strings. Funnel
-/// each variant into the matching `HealthCheck::{healthy,degraded,unhealthy}`
-/// constructor so the JSON body reflects the status (reason included when
-/// applicable).
-async fn health_handler(State(checker): State<Arc<dyn HealthChecker>>) -> Response {
+/// Exposed `pub(crate)` for tests and `pub` for consumers that want to
+/// inline a health handler with custom state wiring.
+pub async fn health_response(checker: Arc<dyn HealthChecker>) -> Response {
     let status = checker.check();
     let service = checker.service_name();
     let version = checker.version();
@@ -101,7 +147,7 @@ mod tests {
     }
 
     async fn send(
-        app: Router,
+        app: Router<()>,
         path: &str,
     ) -> (StatusCode, serde_json::Value) {
         let response = app
@@ -118,7 +164,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_endpoint_returns_200_when_healthy() {
-        let app = health_router(checker());
+        let app = health_router::<()>(checker());
         let (code, body) = send(app, "/health").await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["service"], "tsunagu-axum-test");
@@ -129,14 +175,14 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_endpoint_returns_200_when_healthy() {
-        let app = health_router(checker());
+        let app = health_router::<()>(checker());
         let (code, _) = send(app, "/readiness").await;
         assert_eq!(code, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn liveness_endpoint_returns_200_when_healthy() {
-        let app = health_router(checker());
+        let app = health_router::<()>(checker());
         let (code, _) = send(app, "/liveness").await;
         assert_eq!(code, StatusCode::OK);
     }
@@ -145,7 +191,7 @@ mod tests {
     async fn degraded_state_still_returns_200() {
         let c = Arc::new(SimpleHealthChecker::new("svc", "1.0"));
         c.set_degraded();
-        let app = health_router(c as Arc<dyn HealthChecker>);
+        let app = health_router::<()>(c as Arc<dyn HealthChecker>);
         let (code, body) = send(app, "/health").await;
         assert_eq!(code, StatusCode::OK);
         // Tuple variant serializes as { "Degraded": "reason" }
@@ -156,7 +202,7 @@ mod tests {
     async fn unhealthy_state_returns_503() {
         let c = Arc::new(SimpleHealthChecker::new("svc", "1.0"));
         c.set_unhealthy();
-        let app = health_router(c as Arc<dyn HealthChecker>);
+        let app = health_router::<()>(c as Arc<dyn HealthChecker>);
         let (code, body) = send(app, "/health").await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body["status"].get("Unhealthy").is_some());
@@ -167,24 +213,24 @@ mod tests {
         let c = Arc::new(SimpleHealthChecker::new("svc", "1.0"));
         let arc: Arc<dyn HealthChecker> = c.clone() as Arc<dyn HealthChecker>;
 
-        let app = health_router(arc.clone());
+        let app = health_router::<()>(arc.clone());
         let (code, _) = send(app, "/health").await;
         assert_eq!(code, StatusCode::OK);
 
         c.set_unhealthy();
-        let app = health_router(arc.clone());
+        let app = health_router::<()>(arc.clone());
         let (code, _) = send(app, "/health").await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
 
         c.set_healthy();
-        let app = health_router(arc);
+        let app = health_router::<()>(arc);
         let (code, _) = send(app, "/health").await;
         assert_eq!(code, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn unknown_path_returns_404() {
-        let app = health_router(checker());
+        let app = health_router::<()>(checker());
         let response = app
             .oneshot(
                 Request::builder()
@@ -199,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_carries_service_and_version_fields() {
-        let app = health_router(checker());
+        let app = health_router::<()>(checker());
         let (_, body) = send(app, "/health").await;
         // HealthCheck schema: { service, version, status, ... }
         assert!(body.get("service").is_some());
