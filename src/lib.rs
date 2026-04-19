@@ -23,6 +23,7 @@
 pub mod daemon;
 pub mod error;
 pub mod health;
+pub mod shutdown;
 pub mod socket;
 
 pub use daemon::{DaemonProcess, ProcessChecker, SystemProcessChecker};
@@ -31,4 +32,5 @@ pub use health::{
     HealthCheck, HealthCheckBuilder, HealthChecker, HealthStatus, ParseHealthStatusError,
     SimpleHealthChecker,
 };
+pub use shutdown::{Shutdown, ShutdownController};
 pub use socket::SocketPath;
