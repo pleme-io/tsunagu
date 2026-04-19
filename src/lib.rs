@@ -20,6 +20,8 @@
 //! assert!(hc.is_healthy());
 //! ```
 
+#[cfg(feature = "axum")]
+pub mod axum;
 pub mod daemon;
 pub mod error;
 pub mod health;
