@@ -1,6 +1,6 @@
 [package]
 name = "tsunagu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89.0"
 description = "Tsunagu (繋ぐ) — service/daemon IPC framework: Unix sockets, health checks, process management"
