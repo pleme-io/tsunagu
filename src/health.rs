@@ -537,7 +537,10 @@ mod tests {
     fn display_format_with_version() {
         let hc = HealthCheck::healthy("mado", "0.3.7");
         let s = hc.to_string();
-        assert!(s.contains("v0.3.7"), "display should show 'v' prefix on version: {s}");
+        assert!(
+            s.contains("v0.3.7"),
+            "display should show 'v' prefix on version: {s}"
+        );
     }
 
     #[test]
@@ -840,9 +843,7 @@ mod tests {
 
     #[test]
     fn parse_health_status_error_is_std_error() {
-        let err: Box<dyn std::error::Error> = Box::new(
-            "bad".parse::<HealthStatus>().unwrap_err(),
-        );
+        let err: Box<dyn std::error::Error> = Box::new("bad".parse::<HealthStatus>().unwrap_err());
         assert!(err.to_string().contains("bad"));
     }
 
@@ -1081,8 +1082,14 @@ mod tests {
             fn check(&self) -> HealthStatus {
                 HealthStatus::Degraded("always".to_string())
             }
-            fn service_name(&self) -> &str { "degraded-svc" }
-            fn version(&self) -> &str { "0.0.1" }
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn service_name(&self) -> &str {
+                "degraded-svc"
+            }
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn version(&self) -> &str {
+                "0.0.1"
+            }
         }
 
         let checkers: Vec<Box<dyn HealthChecker>> = vec![
@@ -1102,18 +1109,20 @@ mod tests {
 
         struct AlwaysAlive;
         impl ProcessChecker for AlwaysAlive {
-            fn is_alive(&self, _pid: u32) -> bool { true }
+            fn is_alive(&self, _pid: u32) -> bool {
+                true
+            }
         }
 
         struct NeverAlive;
         impl ProcessChecker for NeverAlive {
-            fn is_alive(&self, _pid: u32) -> bool { false }
+            fn is_alive(&self, _pid: u32) -> bool {
+                false
+            }
         }
 
-        let checkers: Vec<Box<dyn ProcessChecker>> = vec![
-            Box::new(AlwaysAlive),
-            Box::new(NeverAlive),
-        ];
+        let checkers: Vec<Box<dyn ProcessChecker>> =
+            vec![Box::new(AlwaysAlive), Box::new(NeverAlive)];
 
         assert!(checkers[0].is_alive(1));
         assert!(!checkers[1].is_alive(1));

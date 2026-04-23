@@ -43,8 +43,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 
-use crate::health::{HealthChecker, HealthStatus};
 use crate::HealthCheck;
+use crate::health::{HealthChecker, HealthStatus};
 
 /// Router with `/health`, `/readiness`, `/liveness` endpoints.
 ///
@@ -118,10 +118,7 @@ pub async fn health_response(checker: Arc<dyn HealthChecker>) -> Response {
     let service = checker.service_name();
     let version = checker.version();
     let (code, body) = match status {
-        HealthStatus::Healthy => (
-            StatusCode::OK,
-            HealthCheck::healthy(service, version),
-        ),
+        HealthStatus::Healthy => (StatusCode::OK, HealthCheck::healthy(service, version)),
         HealthStatus::Degraded(reason) => (
             StatusCode::OK,
             HealthCheck::degraded(service, version, &reason),
@@ -146,10 +143,7 @@ mod tests {
         Arc::new(SimpleHealthChecker::new("tsunagu-axum-test", "0.0.1"))
     }
 
-    async fn send(
-        app: Router<()>,
-        path: &str,
-    ) -> (StatusCode, serde_json::Value) {
+    async fn send(app: Router<()>, path: &str) -> (StatusCode, serde_json::Value) {
         let response = app
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await

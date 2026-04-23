@@ -105,7 +105,8 @@ impl<C: ProcessChecker> DaemonProcess<C> {
     /// Check if a daemon is already running (PID file exists and process is alive).
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.read_pid().is_some_and(|pid| self.checker.is_alive(pid))
+        self.read_pid()
+            .is_some_and(|pid| self.checker.is_alive(pid))
     }
 
     /// Read the PID from the PID file, if it exists and is valid.
@@ -196,7 +197,7 @@ fn process_alive(pid: u32) -> bool {
     // sending a signal.  Returns 0 on success, -1 on error.  ESRCH means
     // the process doesn't exist; EPERM means it exists but we lack
     // permission — still alive in that case.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let ret = unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap_or(libc::pid_t::MAX), 0) };
     if ret == 0 {
         return true;
     }
@@ -722,8 +723,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let d = test_daemon(&dir);
         let s = d.to_string();
-        assert!(s.contains("test-app"), "display should contain app name: {s}");
-        assert!(s.contains("test.pid"), "display should contain pid path: {s}");
+        assert!(
+            s.contains("test-app"),
+            "display should contain app name: {s}"
+        );
+        assert!(
+            s.contains("test.pid"),
+            "display should contain pid path: {s}"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -811,12 +818,16 @@ mod tests {
         let client_path = d.socket_path().to_path_buf();
         let client = tokio::spawn(async move {
             let mut stream = UnixStream::connect(&client_path).await.unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping").await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping")
+                .await
+                .unwrap();
         });
 
         let (mut conn, _addr) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 4];
-        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf, b"ping");
 
         client.await.unwrap();
@@ -926,12 +937,12 @@ mod tests {
 
     #[test]
     fn system_process_checker_is_default_constructible() {
-        let _checker = SystemProcessChecker::default();
+        let _: SystemProcessChecker = SystemProcessChecker;
     }
 
     #[test]
     fn system_process_checker_rejects_nonexistent_pid() {
-        let checker = SystemProcessChecker::default();
+        let checker = SystemProcessChecker;
         assert!(!checker.is_alive(99_999_999));
     }
 
@@ -952,17 +963,25 @@ mod tests {
         let client_path = d.socket_path().to_path_buf();
         let client = tokio::spawn(async move {
             let mut stream = UnixStream::connect(&client_path).await.unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello").await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, b"hello")
+                .await
+                .unwrap();
             let mut buf = vec![0u8; 5];
-            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut stream, &mut buf)
+                .await
+                .unwrap();
             assert_eq!(&buf, b"world");
         });
 
         let (mut conn, _addr) = listener.accept().await.unwrap();
         let mut buf = vec![0u8; 5];
-        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut conn, &mut buf)
+            .await
+            .unwrap();
         assert_eq!(&buf, b"hello");
-        tokio::io::AsyncWriteExt::write_all(&mut conn, b"world").await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut conn, b"world")
+            .await
+            .unwrap();
 
         client.await.unwrap();
     }

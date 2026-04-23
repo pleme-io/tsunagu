@@ -19,25 +19,31 @@
       ...
     }:
     let
-      system = "aarch64-darwin";
-      pkgs = import nixpkgs { inherit system; };
-      rustLibrary = import "${substrate}/lib/rust-library.nix" {
-        inherit system nixpkgs;
-        nixLib = substrate;
-        inherit crate2nix;
-      };
-      lib = rustLibrary {
-        name = "tsunagu";
-        src = ./.;
-      };
+      systems = [ "aarch64-darwin" "x86_64-linux" "aarch64-linux" ];
+      forEachSystem = f: nixpkgs.lib.genAttrs systems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          rustLibrary = import "${substrate}/lib/rust-library.nix" {
+            inherit system nixpkgs;
+            nixLib = substrate;
+            inherit crate2nix;
+          };
+          result = rustLibrary {
+            name = "tsunagu";
+            src = ./.;
+          };
+        in
+        f { inherit pkgs result; }
+      );
     in
     {
-      inherit (lib) packages devShells apps;
+      packages = forEachSystem ({ result, ... }: result.packages);
+      devShells = forEachSystem ({ result, ... }: result.devShells);
+      apps = forEachSystem ({ result, ... }: result.apps);
+      formatter = forEachSystem ({ pkgs, ... }: pkgs.nixfmt-tree);
 
       overlays.default = final: prev: {
         tsunagu = self.packages.${final.system}.default;
       };
-
-      formatter.${system} = pkgs.nixfmt-tree;
     };
 }
