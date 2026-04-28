@@ -27,6 +27,8 @@ pub mod error;
 pub mod health;
 pub mod shutdown;
 pub mod socket;
+#[cfg(feature = "tracing-init")]
+pub mod tracing_init;
 
 pub use daemon::{DaemonProcess, ProcessChecker, SystemProcessChecker};
 pub use error::TsunaguError;

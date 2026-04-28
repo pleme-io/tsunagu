@@ -22,6 +22,7 @@ Reusable daemon/service communication library for all pleme-io applications that
 | `socket.rs` | `SocketPath` — XDG runtime dir socket paths, PID file paths |
 | `health.rs` | `HealthCheck` — Healthy/Degraded/Unhealthy status with serde |
 | `error.rs` | `TsunaguError` — unified error enum |
+| `tracing_init.rs` | `TracingOpts` + `init` / `init_default` / `init_with` — one-line `tracing_subscriber` bootstrap. Subsumes the 90+ hand-rolled `EnvFilter::try_from_default_env().unwrap_or_else(...)` blocks across the pleme-io fleet. Feature-gated (`tracing-init`) so library consumers don't pay the closure cost. |
 
 ### gRPC Pattern
 
