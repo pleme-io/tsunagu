@@ -80,7 +80,41 @@ pub enum OnTimeout {
     Abandon,
 }
 
-/// How a bounded run is configured. Built with [`BoundedRun::new`].
+/// How a bounded run treats the child's output.
+///
+/// ── ★ WHY THIS IS A CHOICE AND NOT A FIXED POLICY ────────────────────────
+/// v0.1.4 shipped [`Capture::Merged`] only, because the first consumer
+/// (sentinela) wanted one thing: the reason a build failed. A six-repo audit
+/// then showed that contract excludes most of the fleet — `Output.stdout`
+/// always empty is fatal wherever stdout is DATA rather than diagnostics:
+///
+///   * a store path from `nix build --print-out-paths`
+///   * `nix show-config --json` (tail truncation alone guarantees a parse error)
+///   * `nix path-info --all | lines().count()` — a tail gives a SILENTLY WRONG
+///     number, which is worse than the hang it replaced
+///   * a byte-parity harness comparing two stdouts — with both empty, every
+///     probe compares equal and the suite reports 100% parity. A green lie.
+///
+/// Merged stays the default so existing callers are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capture {
+    /// stdout+stderr into ONE file; the tail lands in `Output.stderr` and
+    /// `Output.stdout` is empty. Right when you only want the failure reason
+    /// and the child interleaves diagnostics across both streams.
+    Merged,
+    /// stdout and stderr into SEPARATE files, each independently
+    /// tail-bounded, BOTH populated on return. Right whenever stdout is a
+    /// value the caller parses.
+    Separate,
+    /// No capture at all — the child inherits the caller's stdio. Right for
+    /// a live CI log, an interactive `sudo` prompt, or a streaming build,
+    /// where capturing would break the thing the operator is watching.
+    /// `Output.stdout` and `Output.stderr` are both empty; the deadline and
+    /// the group-kill still apply. This is the "bound it but do not touch
+    /// its output" shape.
+    Inherit,
+}
+
 #[derive(Debug, Clone)]
 pub struct BoundedRun<'a> {
     capture_path: &'a Path,
@@ -88,6 +122,7 @@ pub struct BoundedRun<'a> {
     on_timeout: OnTimeout,
     tail_bytes: usize,
     poll_interval: Duration,
+    capture: Capture,
 }
 
 impl<'a> BoundedRun<'a> {
@@ -106,7 +141,31 @@ impl<'a> BoundedRun<'a> {
             on_timeout: OnTimeout::KillGroup,
             tail_bytes: DEFAULT_TAIL_BYTES,
             poll_interval: Duration::from_secs(1),
+            capture: Capture::Merged,
         }
+    }
+
+    /// Populate BOTH `Output.stdout` and `Output.stderr`, each independently
+    /// tail-bounded. Use this whenever stdout is a value you parse.
+    ///
+    /// stderr is captured beside `capture_path` with a `.err` extension, so
+    /// one caller-supplied path still describes the whole run.
+    #[must_use]
+    pub fn separate_streams(mut self) -> Self {
+        self.capture = Capture::Separate;
+        self
+    }
+
+    /// Do not capture: the child inherits the caller's stdio, and only the
+    /// deadline + group-kill apply.
+    ///
+    /// Both `Output` byte fields come back empty — that is the contract, not
+    /// a failure. Reach for this when capturing would break the point of the
+    /// command: a live CI log, an interactive prompt, a streaming build.
+    #[must_use]
+    pub fn inherit_stdio(mut self) -> Self {
+        self.capture = Capture::Inherit;
+        self
     }
 
     /// Bound the run. **Prefer generous over tight**: a deadline that kills
@@ -167,10 +226,20 @@ impl<'a> BoundedRun<'a> {
     /// pair it with a timeout — see `theory/RECONCILER-LIVENESS.md` §IV:
     /// self-delivery without a bound is a hang generator.
     pub fn run(&self, mut cmd: Command) -> std::io::Result<Output> {
-        let f = File::create(self.capture_path)?;
-        let g = f.try_clone()?;
-        cmd.stdout(Stdio::from(f));
-        cmd.stderr(Stdio::from(g));
+        match self.capture {
+            Capture::Merged => {
+                let f = File::create(self.capture_path)?;
+                let g = f.try_clone()?;
+                cmd.stdout(Stdio::from(f));
+                cmd.stderr(Stdio::from(g));
+            }
+            Capture::Separate => {
+                cmd.stdout(Stdio::from(File::create(self.capture_path)?));
+                cmd.stderr(Stdio::from(File::create(self.err_path())?));
+            }
+            // Inherit: touch neither, so the child writes where we do.
+            Capture::Inherit => {}
+        }
         // Never inherit the caller's stdin: a child that reads it blocks on
         // a descriptor nobody will ever write to.
         cmd.stdin(Stdio::null());
@@ -216,11 +285,34 @@ impl<'a> BoundedRun<'a> {
         }
     }
 
+    /// Where stderr lands under [`Capture::Separate`].
+    fn err_path(&self) -> std::path::PathBuf {
+        let mut p = self.capture_path.to_path_buf();
+        let ext = match p.extension().and_then(|e| e.to_str()) {
+            Some(e) => [e, ".err"].concat(),
+            None => "err".to_owned(),
+        };
+        p.set_extension(ext);
+        p
+    }
+
     fn finish(&self, status: std::process::ExitStatus) -> Output {
-        Output {
-            status,
-            stdout: Vec::new(),
-            stderr: self.take_capture(),
+        match self.capture {
+            Capture::Merged => Output {
+                status,
+                stdout: Vec::new(),
+                stderr: self.take_capture(),
+            },
+            Capture::Separate => Output {
+                status,
+                stdout: take_tail(self.capture_path, self.tail_bytes),
+                stderr: take_tail(&self.err_path(), self.tail_bytes),
+            },
+            Capture::Inherit => Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
         }
     }
 
@@ -228,10 +320,18 @@ impl<'a> BoundedRun<'a> {
     /// output, or a state dir that went read-only, must not turn a
     /// successful child into an error.
     fn take_capture(&self) -> Vec<u8> {
-        let bytes = std::fs::read(self.capture_path).unwrap_or_default();
-        let _ = std::fs::remove_file(self.capture_path);
-        tail_bytes(bytes, self.tail_bytes)
+        take_tail(self.capture_path, self.tail_bytes)
     }
+}
+
+/// Read a capture file, remove it, and keep its bounded tail.
+///
+/// Best-effort: a run that produced no output, or a state dir that went
+/// read-only, must not turn a successful child into an error.
+fn take_tail(path: &Path, max: usize) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    tail_bytes(bytes, max)
 }
 
 /// Kill a child's whole process group.
@@ -440,6 +540,80 @@ mod tests {
             String::from_utf8_lossy(&out.stderr).contains("the reason"),
             "stderr must survive the merge"
         );
+    }
+
+    #[test]
+    fn separate_streams_populates_both_and_never_merges() {
+        // The contract five repos need: stdout is a VALUE, not diagnostics.
+        // Merged capture would make `nix build --print-out-paths`, a JSON
+        // config read, and a byte-parity harness all wrong — the last one
+        // silently, by comparing empty to empty and reporting 100% parity.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("sep");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo /nix/store/abc-value; echo noise >&2");
+
+        let out = BoundedRun::new(&cap)
+            .separate_streams()
+            .timeout(Duration::from_secs(30))
+            .run(cmd)
+            .expect("must not error");
+
+        let so = String::from_utf8_lossy(&out.stdout);
+        let se = String::from_utf8_lossy(&out.stderr);
+        assert!(so.contains("/nix/store/abc-value"), "stdout must be POPULATED: {so:?}");
+        assert!(!so.contains("noise"), "stderr must NOT leak into stdout: {so:?}");
+        assert!(se.contains("noise"), "stderr must be populated: {se:?}");
+        assert!(
+            !se.contains("/nix/store/abc-value"),
+            "stdout must NOT leak into stderr: {se:?}"
+        );
+        assert!(!cap.exists(), "stdout capture cleaned up");
+        assert!(
+            !std::path::Path::new(&format!("{}.err", cap.display())).exists(),
+            "stderr capture cleaned up too"
+        );
+    }
+
+    #[test]
+    fn inherit_stdio_bounds_without_capturing() {
+        // The live-log / interactive shape: a deadline and a group-kill, but
+        // the child's output goes where the caller's does. Empty byte fields
+        // are the CONTRACT here, not a failure.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("inherit");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exit 7");
+
+        let out = BoundedRun::new(&cap)
+            .inherit_stdio()
+            .timeout(Duration::from_secs(30))
+            .run(cmd)
+            .expect("must not error");
+
+        assert_eq!(out.status.code(), Some(7), "status still reported");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "no capture");
+        assert!(!cap.exists(), "no capture file is created at all");
+    }
+
+    #[test]
+    fn inherit_stdio_still_enforces_the_deadline() {
+        // The bound must not be a side effect of capturing.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("inherit-timeout");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 300");
+        cmd.process_group(0);
+
+        let t0 = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .inherit_stdio()
+            .timeout(Duration::from_secs(1))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect_err("deadline applies without capture");
+        assert!(is_timeout(&err));
+        assert!(t0.elapsed() < Duration::from_secs(15));
     }
 
     #[test]
