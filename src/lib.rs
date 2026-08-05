@@ -4,6 +4,8 @@
 //! - [`SocketPath`]: XDG-compliant Unix socket and PID file path resolution
 //! - [`DaemonProcess`]: PID file management, staleness detection, and cleanup
 //! - [`HealthCheck`]: standardized health/liveness/readiness responses
+//! - [`BoundedRun`]: subprocess execution that always ENDS — a deadline, a
+//!   file capture instead of a deadlocking pipe, and a process-GROUP kill
 //!
 //! # Quick Start
 //!
@@ -24,6 +26,7 @@
 pub mod axum;
 pub mod daemon;
 pub mod error;
+pub mod exec;
 pub mod health;
 pub mod shutdown;
 pub mod socket;
@@ -31,6 +34,7 @@ pub mod socket;
 pub mod tracing_init;
 
 pub use daemon::{DaemonProcess, ProcessChecker, SystemProcessChecker};
+pub use exec::{BoundedRun, OnTimeout};
 pub use error::TsunaguError;
 pub use health::{
     HealthCheck, HealthCheckBuilder, HealthChecker, HealthStatus, ParseHealthStatusError,
