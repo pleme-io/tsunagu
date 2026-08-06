@@ -1,5 +1,8 @@
 name: auto-release
 
+# The canonical consumer shim (org ★★ AUTO-RELEASE): every merge to main
+# bumps, tags, pushes and publishes. The pipeline lives once, in
+# pleme-io/substrate; this file only names it.
 on:
   push:
     branches: [main]
