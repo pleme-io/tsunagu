@@ -55,6 +55,15 @@ use std::time::{Duration, Instant};
 /// stays distinguishable from an ordinary non-zero exit.
 pub const TIMEOUT_MARKER: &str = "timed out after";
 
+/// Marker for the SILENCE bound, distinct from [`TIMEOUT_MARKER`] because the
+/// two failures want different operator responses.
+///
+/// A blown total deadline says "this took too long" — maybe legitimately.
+/// A blown silence bound says "this produced NOTHING for N seconds", which is
+/// the signature of a wedge rather than of slow work, and it is actionable
+/// immediately.
+pub const SILENCE_MARKER: &str = "silent for";
+
 /// Default cap on retained output, bytes. The tail is kept, not the head.
 pub const DEFAULT_TAIL_BYTES: usize = 16 * 1024;
 
@@ -123,6 +132,7 @@ pub struct BoundedRun<'a> {
     tail_bytes: usize,
     poll_interval: Duration,
     capture: Capture,
+    silent_after: Option<Duration>,
 }
 
 impl<'a> BoundedRun<'a> {
@@ -142,7 +152,46 @@ impl<'a> BoundedRun<'a> {
             tail_bytes: DEFAULT_TAIL_BYTES,
             poll_interval: Duration::from_secs(1),
             capture: Capture::Merged,
+            silent_after: None,
         }
+    }
+
+    /// Fail the run when the child produces NO OUTPUT for `d`, even though
+    /// its total deadline has not expired.
+    ///
+    /// ── ★ WHY A TOTAL DEADLINE IS NOT ENOUGH ────────────────────────────
+    /// A total deadline has to be sized for the LONGEST LEGITIMATE run, and
+    /// on this fleet that is very long: sentinela allows 5400s for a build
+    /// because a cold rebuild genuinely takes 90 minutes. A process that
+    /// wedges at minute two therefore burns the full 88 remaining minutes
+    /// before anything notices, and the operator watching it cannot tell a
+    /// wedge from slow progress — both look like silence.
+    ///
+    /// MEASURED on rio 2026-08-07: a nix build sat at ZERO CPU for over
+    /// half an hour holding two CLOSE-WAIT HTTPS sockets with unread bytes,
+    /// well inside its total budget. It emitted nothing the entire time. A
+    /// silence bound of a few minutes would have converted 90 minutes of
+    /// ambiguity into one typed failure naming the symptom.
+    ///
+    /// The clock RESETS on every byte written, so a slow-but-progressing
+    /// build is never killed — which is what makes this safe to set much
+    /// tighter than the total deadline.
+    ///
+    /// ── INERT UNDER [`Capture::Inherit`], AND SAID OUT LOUD ─────────────
+    /// Progress is measured by the growth of the capture file. Under
+    /// `Inherit` there is no capture file — the child writes straight to
+    /// the caller's stdio — so there is nothing to measure and this bound
+    /// CANNOT fire. It is deliberately inert rather than approximated: a
+    /// silence bound that guessed would kill live interactive work. If you
+    /// need both a live log and a silence bound, capture and tee.
+    ///
+    /// TIER: only-mitigated. It observes the child's OUTPUT, not its
+    /// progress; a process that prints a heartbeat while doing nothing
+    /// defeats it, and nothing here can tell those apart.
+    #[must_use]
+    pub fn silent_after(mut self, d: Duration) -> Self {
+        self.silent_after = Some(d);
+        self
     }
 
     /// Populate BOTH `Output.stdout` and `Output.stderr`, each independently
@@ -256,9 +305,44 @@ impl<'a> BoundedRun<'a> {
         // and of a second thread whose own failure modes would need
         // bounding too.
         let deadline = Instant::now() + timeout;
+        // Silence tracking. `Inherit` writes to the caller's stdio, so there
+        // is no file whose growth could stand in for progress — the bound is
+        // inert there by construction rather than by a guess.
+        let watch_silence = self.silent_after.is_some() && self.capture != Capture::Inherit;
+        let mut last_size = self.captured_len();
+        let mut last_growth = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(self.finish(status));
+            }
+            if watch_silence {
+                let now_size = self.captured_len();
+                if now_size != last_size {
+                    last_size = now_size;
+                    last_growth = Instant::now();
+                }
+                if let Some(quiet) = self.silent_after {
+                    if last_growth.elapsed() >= quiet {
+                        if self.on_timeout == OnTimeout::KillGroup {
+                            kill_process_group(&child);
+                            let _ = child.wait();
+                        }
+                        let tail = String::from_utf8_lossy(&self.take_capture()).into_owned();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            [
+                                "run ",
+                                SILENCE_MARKER,
+                                " ",
+                                &quiet.as_secs().to_string(),
+                                "s (total deadline not reached) — no output; \
+                                 a wedge, not slow work\n",
+                                &tail,
+                            ]
+                            .concat(),
+                        ));
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 if self.on_timeout == OnTimeout::KillGroup {
@@ -286,6 +370,18 @@ impl<'a> BoundedRun<'a> {
     }
 
     /// Where stderr lands under [`Capture::Separate`].
+    /// Total bytes written to the capture file(s) so far — the progress
+    /// proxy for [`Self::silent_after`]. A missing file reads as 0 rather
+    /// than an error: the child may not have written yet.
+    fn captured_len(&self) -> u64 {
+        let one = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        match self.capture {
+            Capture::Merged => one(self.capture_path),
+            Capture::Separate => one(self.capture_path) + one(&self.err_path()),
+            Capture::Inherit => 0,
+        }
+    }
+
     fn err_path(&self) -> std::path::PathBuf {
         let mut p = self.capture_path.to_path_buf();
         let ext = match p.extension().and_then(|e| e.to_str()) {
@@ -632,5 +728,85 @@ mod tests {
     fn a_capture_under_the_bound_is_untouched() {
         let small = b"error: flake.lock parse error".to_vec();
         assert_eq!(tail_bytes(small.clone(), 16 * 1024), small);
+    }
+
+    /// The wedge signature: a child that produces nothing, well inside its
+    /// total deadline. This is the rio 2026-08-07 shape — zero CPU, two
+    /// CLOSE-WAIT sockets, 88 minutes of budget still on the clock.
+    #[test]
+    fn silence_fires_long_before_the_total_deadline() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("silence-fires");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 300");
+        cmd.process_group(0);
+
+        let t0 = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(120))
+            .silent_after(Duration::from_secs(1))
+            .poll_interval(Duration::from_millis(100))
+            .run(cmd)
+            .expect_err("a silent child must error, not run to its deadline");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            format!("{err}").contains(SILENCE_MARKER),
+            "the failure must name SILENCE, not the total deadline — the two \
+             want different operator responses: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "silence must fire on its own clock, not the 120s deadline; took {elapsed:?}"
+        );
+    }
+
+    /// The property that makes a tight silence bound SAFE: output resets the
+    /// clock, so slow-but-progressing work is never killed. Without this the
+    /// bound would be unusable and every caller would turn it off — the
+    /// failure mode that kills a guard.
+    #[test]
+    fn output_resets_the_silence_clock() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("silence-resets");
+
+        // Prints every 200ms for ~2s, against a 1s silence bound: never
+        // quiet for a whole second, so it must be allowed to finish.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("i=0; while [ $i -lt 10 ]; do echo tick; sleep 0.2; i=$((i+1)); done");
+        cmd.process_group(0);
+
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(60))
+            .silent_after(Duration::from_secs(1))
+            .poll_interval(Duration::from_millis(100))
+            .run(cmd)
+            .expect("a child that keeps printing must NEVER trip the silence bound");
+        assert!(out.status.success());
+    }
+
+    /// Under `Inherit` there is no capture file, so silence cannot be
+    /// measured. It must be INERT rather than approximated — a bound that
+    /// guessed here would kill live interactive work (a sudo prompt, a
+    /// streaming build) for the crime of being quiet.
+    #[test]
+    fn silence_is_inert_under_inherit_rather_than_guessing() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("silence-inherit");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 2");
+        cmd.process_group(0);
+
+        let out = BoundedRun::new(&cap)
+            .inherit_stdio()
+            .timeout(Duration::from_secs(60))
+            .silent_after(Duration::from_millis(200))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect("Inherit has no capture file to measure; the bound must not fire");
+        assert!(out.status.success());
     }
 }
