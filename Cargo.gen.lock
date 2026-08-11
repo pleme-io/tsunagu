@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "f513fa7883be6d12adb033fcbdb11fced5f59f0ef86c48fa2c9b043a9c28c62d",
+  "cargo_lock_sha256": "827086bb0c385b3c0738cafdd784c934b809106aace2f0e90361e119de67ba31",
   "manifest_sha256": {
     "Cargo.toml": "03bc61a9c96976346a189930f7aae3bd4d707ca1cdfad4a3e56c034b8ba8d1db"
   },
@@ -710,11 +710,11 @@
           "getrandom"
         ]
       },
-      "thiserror-2.0.19": {
+      "thiserror-2.0.20": {
         "runtime_dependencies": [
           {
             "name": "thiserror_impl",
-            "package_key": "thiserror-impl-2.0.19",
+            "package_key": "thiserror-impl-2.0.20",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -729,7 +729,7 @@
           "std"
         ]
       },
-      "thiserror-impl-2.0.19": {
+      "thiserror-impl-2.0.20": {
         "runtime_dependencies": [
           {
             "name": "proc_macro2",
@@ -1168,7 +1168,7 @@
           },
           {
             "name": "thiserror",
-            "package_key": "thiserror-2.0.19",
+            "package_key": "thiserror-2.0.20",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2568,11 +2568,11 @@
     "tempfile-3.27.0": {
       "edition": "2021"
     },
-    "thiserror-2.0.19": {
+    "thiserror-2.0.20": {
       "edition": "2021",
       "build_script": "build.rs"
     },
-    "thiserror-impl-2.0.19": {
+    "thiserror-impl-2.0.20": {
       "edition": "2021",
       "proc_macro": true
     },
