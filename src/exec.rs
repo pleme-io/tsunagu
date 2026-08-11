@@ -64,6 +64,29 @@ pub const TIMEOUT_MARKER: &str = "timed out after";
 /// immediately.
 pub const SILENCE_MARKER: &str = "silent for";
 
+/// Marker for the ERROR-THEN-QUIET bound — the wedge signal that does not
+/// wait out a generous clock.
+///
+/// [`SILENCE_MARKER`] answers "is it stuck?" with a timer, and a timer must be
+/// generous or it kills honest slow work: a single long compile inside
+/// `nix build` legitimately prints nothing for many minutes. So silence alone
+/// can only ever notice a wedge LATE.
+///
+/// A failure that has already been REPORTED is a stronger signal than quiet.
+/// Once the child has printed its own error text, there is nothing left for it
+/// to succeed at, and continued silence means the process tree is not winding
+/// down — it is stuck. Measured on cid 2026-08-11: `nix build` errored and
+/// exited while a `jq` downstream of it held for 89 more minutes waiting on an
+/// EOF that nothing would send. The error was on disk within seconds; the
+/// daemon spent 5400s not reading it.
+///
+/// Requiring BOTH the marker and a quiet period is what keeps this from being
+/// worse than the hang it replaces. A build that prints `error:` and keeps
+/// working — `nix --keep-going`, a compiler emitting diagnostics, a test suite
+/// logging an expected failure — keeps resetting the quiet window and is never
+/// killed. Only "reported a failure, then stopped doing anything" trips it.
+pub const ERROR_WEDGE_MARKER: &str = "reported an error then went quiet for";
+
 /// Default cap on retained output, bytes. The tail is kept, not the head.
 pub const DEFAULT_TAIL_BYTES: usize = 16 * 1024;
 
@@ -133,6 +156,7 @@ pub struct BoundedRun<'a> {
     poll_interval: Duration,
     capture: Capture,
     silent_after: Option<Duration>,
+    error_wedge: Option<(String, Duration)>,
 }
 
 impl<'a> BoundedRun<'a> {
@@ -153,7 +177,29 @@ impl<'a> BoundedRun<'a> {
             poll_interval: Duration::from_secs(1),
             capture: Capture::Merged,
             silent_after: None,
+            error_wedge: None,
         }
+    }
+
+    /// Fail the run when the capture contains `marker` AND has not grown for
+    /// `quiet` — "it told us it failed, then stopped" — without waiting for
+    /// the total deadline or the (necessarily generous) silence bound.
+    ///
+    /// See [`ERROR_WEDGE_MARKER`] for why both conditions are required: the
+    /// marker alone would kill any build whose output merely CONTAINS the
+    /// word, and quiet alone must be generous enough to miss the wedge for
+    /// half an hour. Together they are specific to the shape that actually
+    /// occurs.
+    ///
+    /// `quiet` can therefore be short — the child has already said it failed,
+    /// so the only question is whether its tree is still winding down.
+    ///
+    /// Inert under [`Capture::Inherit`], which has no capture to scan; the
+    /// builder accepts the call so a caller need not branch on capture mode.
+    #[must_use]
+    pub fn error_wedge(mut self, marker: impl Into<String>, quiet: Duration) -> Self {
+        self.error_wedge = Some((marker.into(), quiet));
+        self
     }
 
     /// Fail the run when the child produces NO OUTPUT for `d`, even though
@@ -309,17 +355,62 @@ impl<'a> BoundedRun<'a> {
         // is no file whose growth could stand in for progress — the bound is
         // inert there by construction rather than by a guess.
         let watch_silence = self.silent_after.is_some() && self.capture != Capture::Inherit;
+        // Same capture precondition as the silence watch: with no capture
+        // there is nothing to scan, so the feature is inert rather than
+        // wrong.
+        let watch_error = self.error_wedge.is_some() && self.capture != Capture::Inherit;
+        let mut saw_error = false;
+        // The scan is driven by growth, so it needs one unconditional pass:
+        // a child that writes its error before the first poll would otherwise
+        // never be scanned at all.
+        let mut scanned_once = false;
         let mut last_size = self.captured_len();
         let mut last_growth = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
                 return Ok(self.finish(status));
             }
-            if watch_silence {
+            if watch_silence || watch_error {
                 let now_size = self.captured_len();
-                if now_size != last_size {
+                let grew = now_size != last_size;
+                if grew {
                     last_size = now_size;
                     last_growth = Instant::now();
+                }
+                // Rescan on growth, plus one unconditional first pass.
+                // `saw_error` is sticky: an error already printed keeps
+                // counting even if later output would push it out of view.
+                if watch_error && !saw_error && (grew || !scanned_once) {
+                    scanned_once = true;
+                    if let Some((marker, _)) = &self.error_wedge {
+                        saw_error = String::from_utf8_lossy(&self.capture_bytes())
+                            .contains(marker.as_str());
+                    }
+                }
+                if saw_error {
+                    if let Some((_, quiet)) = &self.error_wedge {
+                        if last_growth.elapsed() >= *quiet {
+                            if self.on_timeout == OnTimeout::KillGroup {
+                                kill_process_group(&child);
+                                let _ = child.wait();
+                            }
+                            let tail =
+                                String::from_utf8_lossy(&self.take_capture()).into_owned();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                [
+                                    "run ",
+                                    ERROR_WEDGE_MARKER,
+                                    " ",
+                                    &quiet.as_secs().to_string(),
+                                    "s — the failure is already reported below; \
+                                     the tree stopped winding down\n",
+                                    &tail,
+                                ]
+                                .concat(),
+                            ));
+                        }
+                    }
                 }
                 if let Some(quiet) = self.silent_after {
                     if last_growth.elapsed() >= quiet {
@@ -379,6 +470,22 @@ impl<'a> BoundedRun<'a> {
             Capture::Merged => one(self.capture_path),
             Capture::Separate => one(self.capture_path) + one(&self.err_path()),
             Capture::Inherit => 0,
+        }
+    }
+
+    /// Whole capture as bytes, non-destructively (unlike `take_capture`).
+    /// Used only by the error-wedge scan, which must leave the file intact
+    /// for the eventual `finish`/`take_capture`.
+    fn capture_bytes(&self) -> Vec<u8> {
+        let one = |p: &std::path::Path| std::fs::read(p).unwrap_or_default();
+        match self.capture {
+            Capture::Merged => one(self.capture_path),
+            Capture::Separate => {
+                let mut v = one(self.capture_path);
+                v.extend_from_slice(&one(&self.err_path()));
+                v
+            }
+            Capture::Inherit => Vec::new(),
         }
     }
 
@@ -636,6 +743,87 @@ mod tests {
             String::from_utf8_lossy(&out.stderr).contains("the reason"),
             "stderr must survive the merge"
         );
+    }
+
+
+    #[test]
+    fn error_then_quiet_is_a_wedge_and_does_not_wait_out_the_clock() {
+        // The cid 2026-08-11 shape, minimised: the work reports a failure and
+        // exits, a downstream holder keeps the tree alive doing nothing. The
+        // run must end on the error+quiet signal, NOT on the 60s deadline.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("errwedge");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo 'error: builder failed'; sleep 60");
+        // Required for the group kill to reach the `sleep`; without it the
+        // guard still fires on time but `child.wait()` blocks until the sleep
+        // ends, which is what this test's elapsed-time assertion caught.
+        cmd.process_group(0);
+
+        let started = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(60))
+            .error_wedge("error:", Duration::from_millis(300))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect_err("an error followed by quiet must fail the run");
+
+        assert!(
+            format!("{err}").contains(ERROR_WEDGE_MARKER),
+            "must be reported as an error-wedge, not a plain timeout: {err}"
+        );
+        assert!(
+            format!("{err}").contains("error: builder failed"),
+            "the reported failure must be carried in the tail: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not wait out the deadline: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn error_followed_by_progress_is_never_killed() {
+        // The false-positive this guard must not have. `nix --keep-going`, a
+        // compiler emitting diagnostics, a suite logging an expected failure:
+        // output CONTAINS the marker and the work is healthy. Each new line
+        // resets the quiet window, so the run completes normally.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("errprogress");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("echo 'error: one target failed'; for i in 1 2 3 4 5 6; do sleep 0.1; echo still working; done; exit 0");
+
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .error_wedge("error:", Duration::from_millis(300))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect("a build that keeps making progress must NOT be killed");
+
+        assert!(out.status.success(), "must exit normally: {:?}", out.status);
+    }
+
+    #[test]
+    fn quiet_without_an_error_is_not_a_wedge() {
+        // The other half of the specificity claim: silence alone must not
+        // trip THIS guard, or it collapses into `silent_after` and inherits
+        // its need to be generous. A long quiet stretch with no reported
+        // failure is ordinary slow work.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("quietok");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo compiling; sleep 1; echo done; exit 0");
+
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .error_wedge("error:", Duration::from_millis(200))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect("silence without a reported error must not be killed");
+
+        assert!(out.status.success(), "must exit normally: {:?}", out.status);
     }
 
     #[test]
