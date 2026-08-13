@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "e928ce731f24012fc141814b3e0b409ba8ef0bd24fe3c95aeba68429b4e035a4",
+  "cargo_lock_sha256": "453f59cbefc24880735b4eebb0b9e3b474b50fcd8fa5a496987b345eb010f687",
   "manifest_sha256": {
-    "Cargo.toml": "baf0375c97b6c19409423cd7c81a87b453ba50a2923ab946f3f35e8db92a2acb"
+    "Cargo.toml": "72055bfa35af7518ceed67638c91e5044de4a240fbdb631921e5a69b72921109"
   },
   "target_resolves": {
     "base": {
@@ -319,7 +319,7 @@
           "os-poll"
         ]
       },
-      "okiba-0.2.1": {
+      "okiba-0.3.1": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": []
@@ -1139,7 +1139,7 @@
           },
           {
             "name": "okiba",
-            "package_key": "okiba-0.2.1",
+            "package_key": "okiba-0.3.1",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -2521,7 +2521,7 @@
     "mio-1.2.2": {
       "edition": "2021"
     },
-    "okiba-0.2.1": {
+    "okiba-0.3.1": {
       "edition": "2024"
     },
     "once_cell-1.21.4": {

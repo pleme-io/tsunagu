@@ -41,7 +41,7 @@ dirs = "6.0"
 # per spec rather than joined. runtime_base took $XDG_RUNTIME_DIR verbatim, so
 # an empty one made every socket AND pidfile path cwd-relative — across all 28
 # consumers of this crate.
-okiba = "0.2"
+okiba = "0.3"
 # Process-group kill for `exec::BoundedRun`. rustix rather than raw libc so
 # a consumer under `#![forbid(unsafe_code)]` can take this crate — sentinela
 # is exactly that, and it is consumer #1.

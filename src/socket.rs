@@ -55,10 +55,16 @@ impl SocketPath {
     /// waiting for a second test to want the same variable. An untestable path
     /// resolver is how the unguarded branch survived here in the first place.
     fn runtime_base_from(places: &okiba::Okiba, app_name: &str) -> PathBuf {
+        // The fallback is constructed through AbsPath too, so every arm of this
+        // chain carries the invariant rather than only the okiba one.
         places
             .base(okiba::Tier::Runtime)
-            .unwrap_or_else(|_| dirs::runtime_dir().unwrap_or_else(std::env::temp_dir))
+            .unwrap_or_else(|_| {
+                okiba::AbsPath::new(dirs::runtime_dir().unwrap_or_else(std::env::temp_dir))
+                    .expect("the platform runtime dir and temp dir are absolute")
+            })
             .join(app_name)
+            .into_path_buf()
     }
 
     /// Internal helper: `runtime_base(app) / {app}.{ext}`.
