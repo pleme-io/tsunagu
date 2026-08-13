@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "38afdd0d6a29c05c2e43422f5ef31cf96f13420515d9e0be75c353a279548566",
+  "cargo_lock_sha256": "e928ce731f24012fc141814b3e0b409ba8ef0bd24fe3c95aeba68429b4e035a4",
   "manifest_sha256": {
-    "Cargo.toml": "f7895b891bdd7f1503783fd80aa639945bfa58bfae8f59aa5e5981dec71ccf72"
+    "Cargo.toml": "baf0375c97b6c19409423cd7c81a87b453ba50a2923ab946f3f35e8db92a2acb"
   },
   "target_resolves": {
     "base": {
@@ -116,7 +116,7 @@
           "std"
         ]
       },
-      "futures-core-0.3.33": {
+      "futures-core-0.3.34": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
@@ -125,18 +125,18 @@
           "std"
         ]
       },
-      "futures-task-0.3.33": {
+      "futures-task-0.3.34": {
         "runtime_dependencies": [],
         "build_dependencies": [],
         "features": [
           "alloc"
         ]
       },
-      "futures-util-0.3.33": {
+      "futures-util-0.3.34": {
         "runtime_dependencies": [
           {
             "name": "futures_core",
-            "package_key": "futures-core-0.3.33",
+            "package_key": "futures-core-0.3.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -146,7 +146,7 @@
           },
           {
             "name": "futures_task",
-            "package_key": "futures-task-0.3.33",
+            "package_key": "futures-task-0.3.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": false,
@@ -941,7 +941,7 @@
         "runtime_dependencies": [
           {
             "name": "futures_core",
-            "package_key": "futures-core-0.3.33",
+            "package_key": "futures-core-0.3.34",
             "kind": "normal",
             "features": [],
             "uses_default_features": true,
@@ -951,7 +951,7 @@
           },
           {
             "name": "futures_util",
-            "package_key": "futures-util-0.3.33",
+            "package_key": "futures-util-0.3.34",
             "kind": "normal",
             "features": [
               "alloc"
@@ -1125,7 +1125,7 @@
           "std"
         ]
       },
-      "tsunagu-0.1.7": {
+      "tsunagu-0.1.8": {
         "runtime_dependencies": [
           {
             "name": "dirs",
@@ -2489,13 +2489,13 @@
     "fastrand-2.5.0": {
       "edition": "2018"
     },
-    "futures-core-0.3.33": {
+    "futures-core-0.3.34": {
       "edition": "2018"
     },
-    "futures-task-0.3.33": {
+    "futures-task-0.3.34": {
       "edition": "2018"
     },
-    "futures-util-0.3.33": {
+    "futures-util-0.3.34": {
       "edition": "2018"
     },
     "getrandom-0.4.3": {
@@ -2620,7 +2620,7 @@
     "tracing-core-0.1.36": {
       "edition": "2018"
     },
-    "tsunagu-0.1.7": {
+    "tsunagu-0.1.8": {
       "edition": "2024",
       "lib_target": {
         "name": "tsunagu",
