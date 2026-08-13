@@ -24,14 +24,41 @@ impl SocketPath {
 
     /// Resolve the base runtime directory for an application.
     ///
-    /// Uses `$XDG_RUNTIME_DIR` if set, otherwise falls back to `/tmp`.
+    /// `$XDG_RUNTIME_DIR` when it is set AND ABSOLUTE, else the platform
+    /// runtime dir, else the temp dir. The result is always absolute.
+    ///
+    /// The absolute check is why this goes through okiba. The previous form
+    /// took the variable verbatim (`PathBuf::from` on the Ok arm), accepting
+    /// `""` and any relative path.
+    ///
+    /// Note the asymmetry that made it easy to miss: the UNSET branch was
+    /// already safe, because `dirs::runtime_dir` applies its own
+    /// `is_absolute_path` filter. Only the SET branch was unguarded — so
+    /// unsetting the variable behaved correctly while emptying it yielded a
+    /// bare relative `{app}/{app}.sock`.
+    ///
+    /// For a socket and a pidfile that is the worst available failure: two
+    /// processes of the same app started from different working directories
+    /// bind and dial different paths, each sees no peer and no stale pidfile,
+    /// and both report themselves healthy. A "singleton" daemon silently
+    /// becomes two.
     #[must_use]
     pub fn runtime_base(app_name: &str) -> PathBuf {
-        let base = std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| dirs::runtime_dir().unwrap_or_else(std::env::temp_dir),
-            PathBuf::from,
-        );
-        base.join(app_name)
+        Self::runtime_base_from(&okiba::Okiba::for_app(app_name), app_name)
+    }
+
+    /// The resolution itself, against an explicit [`okiba::Okiba`].
+    ///
+    /// Split out so the invariant can be tested against a CONSTRUCTED
+    /// environment. The alternative in this file mutates `std::env` under an
+    /// `unsafe` block and a "test runs single-threaded" comment — a race
+    /// waiting for a second test to want the same variable. An untestable path
+    /// resolver is how the unguarded branch survived here in the first place.
+    fn runtime_base_from(places: &okiba::Okiba, app_name: &str) -> PathBuf {
+        places
+            .base(okiba::Tier::Runtime)
+            .unwrap_or_else(|_| dirs::runtime_dir().unwrap_or_else(std::env::temp_dir))
+            .join(app_name)
     }
 
     /// Internal helper: `runtime_base(app) / {app}.{ext}`.
@@ -63,6 +90,49 @@ mod tests {
         let sock = SocketPath::for_app("myapp");
         let pid = SocketPath::pid_file("myapp");
         assert_eq!(sock.parent(), pid.parent());
+    }
+
+    fn places(env: &[(&str, &str)]) -> okiba::Okiba {
+        let owned: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        okiba::Okiba::from_env("t", move |k| {
+            owned.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        })
+    }
+
+    /// THE invariant, and the one that matters for 28 consumer crates: the
+    /// socket and pidfile base is absolute whatever the environment says.
+    #[test]
+    fn the_runtime_base_is_absolute_under_every_environment() {
+        for env in [
+            vec![],
+            vec![("XDG_RUNTIME_DIR", "")],
+            vec![("XDG_RUNTIME_DIR", ".")],
+            vec![("XDG_RUNTIME_DIR", "relative/run")],
+            vec![("XDG_RUNTIME_DIR", "/run/user/1000")],
+            vec![("HOME", "/home/op")],
+        ] {
+            let got = SocketPath::runtime_base_from(&places(&env), "karakuri");
+            assert!(got.is_absolute(), "{env:?} produced a relative {got:?}");
+        }
+    }
+
+    /// The exact regression: a SET-but-invalid value was the unguarded case.
+    #[test]
+    fn an_empty_runtime_dir_is_ignored_not_joined() {
+        let got = SocketPath::runtime_base_from(&places(&[("XDG_RUNTIME_DIR", "")]), "karakuri");
+        assert!(got.is_absolute(), "empty override leaked a relative {got:?}");
+        assert!(!got.starts_with("karakuri"), "landed in the cwd: {got:?}");
+    }
+
+    /// An absolute override is still honoured verbatim.
+    #[test]
+    fn an_absolute_runtime_dir_is_used() {
+        let got =
+            SocketPath::runtime_base_from(&places(&[("XDG_RUNTIME_DIR", "/run/user/1000")]), "k");
+        assert_eq!(got, PathBuf::from("/run/user/1000/k"));
     }
 
     #[test]

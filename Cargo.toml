@@ -37,6 +37,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"], optional = true }
 thiserror = "2"
 dirs = "6.0"
+# okiba (置き場) — XDG resolution where a RELATIVE or empty override is IGNORED
+# per spec rather than joined. runtime_base took $XDG_RUNTIME_DIR verbatim, so
+# an empty one made every socket AND pidfile path cwd-relative — across all 28
+# consumers of this crate.
+okiba = "0.2"
 # Process-group kill for `exec::BoundedRun`. rustix rather than raw libc so
 # a consumer under `#![forbid(unsafe_code)]` can take this crate — sentinela
 # is exactly that, and it is consumer #1.
