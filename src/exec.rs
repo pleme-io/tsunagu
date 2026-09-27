@@ -181,15 +181,24 @@ impl<'a> BoundedRun<'a> {
         }
     }
 
-    /// Fail the run when the capture contains `marker` AND has not grown for
-    /// `quiet` — "it told us it failed, then stopped" — without waiting for
-    /// the total deadline or the (necessarily generous) silence bound.
+    /// Fail the run when a line of the capture STARTS with `marker` AND the
+    /// capture has not grown for `quiet` — "it told us it failed, then
+    /// stopped" — without waiting for the total deadline or the (necessarily
+    /// generous) silence bound.
     ///
     /// See [`ERROR_WEDGE_MARKER`] for why both conditions are required: the
     /// marker alone would kill any build whose output merely CONTAINS the
     /// word, and quiet alone must be generous enough to miss the wedge for
     /// half an hour. Together they are specific to the shape that actually
     /// occurs.
+    ///
+    /// Anchored at the start of a line because that is where nix prints its
+    /// own failures (`error: builder for …`). Anywhere in a line matched nix's
+    /// WARNINGS too: `warning: error: unable to download
+    /// 'http://rio:5000/nix-cache-info'` is printed on every run while a
+    /// substituter is down, and measured on plo 2026-09-27 it made every
+    /// rebuild look failed; the first long quiet compile then killed the
+    /// build, 78 times in a row.
     ///
     /// `quiet` can therefore be short — the child has already said it failed,
     /// so the only question is whether its tree is still winding down.
@@ -384,7 +393,8 @@ impl<'a> BoundedRun<'a> {
                     scanned_once = true;
                     if let Some((marker, _)) = &self.error_wedge {
                         saw_error = String::from_utf8_lossy(&self.capture_bytes())
-                            .contains(marker.as_str());
+                            .lines()
+                            .any(|line| line.starts_with(marker.as_str()));
                     }
                 }
                 if saw_error {
@@ -781,6 +791,26 @@ mod tests {
             "must not wait out the deadline: took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_warning_that_mentions_error_is_not_a_failure() {
+        // plo, 2026-09-27: nix prints this on every run while a substituter
+        // is down. It contains the marker mid-line and reports no failure, so
+        // quiet after it must not kill the run.
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("errwarning");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(
+            "echo \"warning: error: unable to download 'http://rio:5000/nix-cache-info': Timeout was reached\"; sleep 1; exit 0",
+        );
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .error_wedge("error:", Duration::from_millis(300))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect("a warning followed by quiet is not a wedge");
+        assert!(out.status.success());
     }
 
     #[test]
