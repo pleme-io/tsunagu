@@ -34,8 +34,8 @@ pub mod socket;
 pub mod tracing_init;
 
 pub use daemon::{DaemonProcess, ProcessChecker, SystemProcessChecker};
-pub use exec::{BoundedRun, OnTimeout};
 pub use error::TsunaguError;
+pub use exec::{BoundedRun, OnTimeout, PollAction, Progress};
 pub use health::{
     HealthCheck, HealthCheckBuilder, HealthChecker, HealthStatus, ParseHealthStatusError,
     SimpleHealthChecker,

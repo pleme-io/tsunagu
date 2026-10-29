@@ -87,6 +87,24 @@ pub const SILENCE_MARKER: &str = "silent for";
 /// killed. Only "reported a failure, then stopped doing anything" trips it.
 pub const ERROR_WEDGE_MARKER: &str = "reported an error then went quiet for";
 
+pub const SURVIVOR_MARKER: &str = "exited, but its process group stayed alive and silent for";
+
+pub const OBSERVER_MARKER: &str = "stopped by its observer:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    pub elapsed: Duration,
+    pub output_bytes: u64,
+    pub quiet: Duration,
+    pub leader_exited: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollAction {
+    Continue,
+    KillGroup(String),
+}
+
 /// Default cap on retained output, bytes. The tail is kept, not the head.
 pub const DEFAULT_TAIL_BYTES: usize = 16 * 1024;
 
@@ -157,6 +175,7 @@ pub struct BoundedRun<'a> {
     capture: Capture,
     silent_after: Option<Duration>,
     error_wedge: Option<(String, Duration)>,
+    survivors_quiet: Option<Duration>,
 }
 
 impl<'a> BoundedRun<'a> {
@@ -178,7 +197,14 @@ impl<'a> BoundedRun<'a> {
             capture: Capture::Merged,
             silent_after: None,
             error_wedge: None,
+            survivors_quiet: None,
         }
+    }
+
+    #[must_use]
+    pub fn await_group(mut self, quiet: Duration) -> Self {
+        self.survivors_quiet = Some(quiet);
+        self
     }
 
     /// Fail the run when a line of the capture STARTS with `marker` AND the
@@ -329,7 +355,24 @@ impl<'a> BoundedRun<'a> {
     /// **before** calling this. That is exactly what makes hazard 1 live, so
     /// pair it with a timeout — see `theory/RECONCILER-LIVENESS.md` §IV:
     /// self-delivery without a bound is a hang generator.
-    pub fn run(&self, mut cmd: Command) -> std::io::Result<Output> {
+    pub fn run(&self, cmd: Command) -> std::io::Result<Output> {
+        self.run_inner(cmd, None)
+    }
+
+    pub fn run_observed(
+        &self,
+        cmd: Command,
+        observer: &mut dyn FnMut(&Progress) -> PollAction,
+    ) -> std::io::Result<Output> {
+        self.run_inner(cmd, Some(observer))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_inner(
+        &self,
+        mut cmd: Command,
+        mut observer: Option<&mut dyn FnMut(&Progress) -> PollAction>,
+    ) -> std::io::Result<Output> {
         match self.capture {
             Capture::Merged => {
                 let f = File::create(self.capture_path)?;
@@ -350,16 +393,19 @@ impl<'a> BoundedRun<'a> {
 
         let mut child = cmd.spawn()?;
 
-        let Some(timeout) = self.timeout else {
+        let started = Instant::now();
+        if self.timeout.is_none() && observer.is_none() && self.survivors_quiet.is_none() {
             let status = child.wait()?;
             return Ok(self.finish(status));
-        };
+        }
 
         // `try_wait` polling rather than a wait-with-timeout syscall: std
         // has no portable one, and this keeps the module free of `unsafe`
         // and of a second thread whose own failure modes would need
         // bounding too.
-        let deadline = Instant::now() + timeout;
+        let deadline = self.timeout.map(|t| started + t);
+        let watch_survivors = self.survivors_quiet.is_some() && self.capture != Capture::Inherit;
+        let mut leader: Option<std::process::ExitStatus> = None;
         // Silence tracking. `Inherit` writes to the caller's stdio, so there
         // is no file whose growth could stand in for progress — the bound is
         // inert there by construction rather than by a guess.
@@ -376,16 +422,65 @@ impl<'a> BoundedRun<'a> {
         let mut last_size = self.captured_len();
         let mut last_growth = Instant::now();
         loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(self.finish(status));
+            match leader {
+                None => {
+                    if let Some(status) = child.try_wait()? {
+                        if !watch_survivors || !group_alive(&child) {
+                            return Ok(self.finish(status));
+                        }
+                        leader = Some(status);
+                    }
+                }
+                Some(status) => {
+                    if !group_alive(&child) {
+                        return Ok(self.finish(status));
+                    }
+                }
+            }
+            let now_size = self.captured_len();
+            let grew = now_size != last_size;
+            if grew {
+                last_size = now_size;
+                last_growth = Instant::now();
+            }
+            if let (Some(_), Some(quiet)) = (leader, self.survivors_quiet)
+                && last_growth.elapsed() >= quiet
+            {
+                if self.on_timeout == OnTimeout::KillGroup {
+                    kill_process_group(&child);
+                }
+                let tail = String::from_utf8_lossy(&self.take_capture()).into_owned();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    [
+                        "run ",
+                        SURVIVOR_MARKER,
+                        " ",
+                        &quiet.as_secs().to_string(),
+                        "s — a descendant still holds the tree open with nothing left to wait for\n",
+                        &tail,
+                    ]
+                    .concat(),
+                ));
+            }
+            if let Some(obs) = observer.as_mut() {
+                let progress = Progress {
+                    elapsed: started.elapsed(),
+                    output_bytes: now_size,
+                    quiet: last_growth.elapsed(),
+                    leader_exited: leader.is_some(),
+                };
+                if let PollAction::KillGroup(reason) = obs(&progress) {
+                    kill_process_group(&child);
+                    let _ = child.wait();
+                    let tail = String::from_utf8_lossy(&self.take_capture()).into_owned();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        ["run ", OBSERVER_MARKER, " ", &reason, "\n", &tail].concat(),
+                    ));
+                }
             }
             if watch_silence || watch_error {
-                let now_size = self.captured_len();
-                let grew = now_size != last_size;
-                if grew {
-                    last_size = now_size;
-                    last_growth = Instant::now();
-                }
                 // Rescan on growth, plus one unconditional first pass.
                 // `saw_error` is sticky: an error already printed keeps
                 // counting even if later output would push it out of view.
@@ -404,8 +499,7 @@ impl<'a> BoundedRun<'a> {
                                 kill_process_group(&child);
                                 let _ = child.wait();
                             }
-                            let tail =
-                                String::from_utf8_lossy(&self.take_capture()).into_owned();
+                            let tail = String::from_utf8_lossy(&self.take_capture()).into_owned();
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
                                 [
@@ -445,7 +539,7 @@ impl<'a> BoundedRun<'a> {
                     }
                 }
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
                 if self.on_timeout == OnTimeout::KillGroup {
                     kill_process_group(&child);
                     // Reap, so the child does not linger as a zombie — the
@@ -459,7 +553,7 @@ impl<'a> BoundedRun<'a> {
                         "run ",
                         TIMEOUT_MARKER,
                         " ",
-                        &timeout.as_secs().to_string(),
+                        &self.timeout.unwrap_or_default().as_secs().to_string(),
                         "s\n",
                         &tail,
                     ]
@@ -561,6 +655,16 @@ fn take_tail(path: &Path, max: usize) -> Vec<u8> {
 ///
 /// Uses rustix's safe wrapper rather than `libc::killpg` in an `unsafe`
 /// block, so a consumer under `#![forbid(unsafe_code)]` can take this crate.
+#[must_use]
+pub fn group_alive(child: &std::process::Child) -> bool {
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return false;
+    };
+    rustix::process::Pid::from_raw(raw).is_some_and(|pid| {
+        rustix::process::test_kill_process_group(pid) != Err(rustix::io::Errno::SRCH)
+    })
+}
+
 pub fn kill_process_group(child: &std::process::Child) {
     let Ok(raw) = i32::try_from(child.id()) else {
         return;
@@ -661,7 +765,12 @@ mod tests {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(
-            ["(sleep 4; touch '", &marker.display().to_string(), "') & sleep 300"].concat(),
+            [
+                "(sleep 4; touch '",
+                &marker.display().to_string(),
+                "') & sleep 300",
+            ]
+            .concat(),
         );
         cmd.process_group(0);
 
@@ -755,7 +864,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn error_then_quiet_is_a_wedge_and_does_not_wait_out_the_clock() {
         // The cid 2026-08-11 shape, minimised: the work reports a failure and
@@ -844,7 +952,8 @@ mod tests {
         let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let cap = tmp("quietok");
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("echo compiling; sleep 1; echo done; exit 0");
+        cmd.arg("-c")
+            .arg("echo compiling; sleep 1; echo done; exit 0");
 
         let out = BoundedRun::new(&cap)
             .timeout(Duration::from_secs(30))
@@ -865,7 +974,8 @@ mod tests {
         let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let cap = tmp("sep");
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("echo /nix/store/abc-value; echo noise >&2");
+        cmd.arg("-c")
+            .arg("echo /nix/store/abc-value; echo noise >&2");
 
         let out = BoundedRun::new(&cap)
             .separate_streams()
@@ -875,8 +985,14 @@ mod tests {
 
         let so = String::from_utf8_lossy(&out.stdout);
         let se = String::from_utf8_lossy(&out.stderr);
-        assert!(so.contains("/nix/store/abc-value"), "stdout must be POPULATED: {so:?}");
-        assert!(!so.contains("noise"), "stderr must NOT leak into stdout: {so:?}");
+        assert!(
+            so.contains("/nix/store/abc-value"),
+            "stdout must be POPULATED: {so:?}"
+        );
+        assert!(
+            !so.contains("noise"),
+            "stderr must NOT leak into stdout: {so:?}"
+        );
         assert!(se.contains("noise"), "stderr must be populated: {se:?}");
         assert!(
             !se.contains("/nix/store/abc-value"),
@@ -993,7 +1109,8 @@ mod tests {
         // Prints every 200ms for ~2s, against a 1s silence bound: never
         // quiet for a whole second, so it must be allowed to finish.
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg("i=0; while [ $i -lt 10 ]; do echo tick; sleep 0.2; i=$((i+1)); done");
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 10 ]; do echo tick; sleep 0.2; i=$((i+1)); done");
         cmd.process_group(0);
 
         let out = BoundedRun::new(&cap)
@@ -1026,5 +1143,207 @@ mod tests {
             .run(cmd)
             .expect("Inherit has no capture file to measure; the bound must not fire");
         assert!(out.status.success());
+    }
+
+    fn sh(script: &str, group: bool) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        if group {
+            cmd.process_group(0);
+        }
+        cmd
+    }
+
+    #[test]
+    fn the_observer_sees_every_poll_with_advancing_time_and_output() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("observe");
+        let mut seen: Vec<Progress> = Vec::new();
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .poll_interval(Duration::from_millis(50))
+            .run_observed(
+                sh("for i in 1 2 3 4 5; do echo tick; sleep 0.1; done", true),
+                &mut |p| {
+                    seen.push(*p);
+                    PollAction::Continue
+                },
+            )
+            .expect("a healthy run under an observer succeeds");
+        assert!(out.status.success());
+        assert!(seen.len() >= 5, "one call per poll: {}", seen.len());
+        assert!(seen.windows(2).all(|w| w[1].elapsed >= w[0].elapsed));
+        assert!(seen.first().unwrap().elapsed < seen.last().unwrap().elapsed);
+        assert!(seen.last().unwrap().output_bytes >= 15, "{:?}", seen.last());
+        assert!(
+            seen.windows(2)
+                .all(|w| w[1].output_bytes >= w[0].output_bytes)
+        );
+        assert!(seen.iter().all(|p| !p.leader_exited));
+        assert!(seen.iter().all(|p| p.quiet <= p.elapsed));
+    }
+
+    #[test]
+    fn the_observer_runs_without_a_deadline() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("observe-nodeadline");
+        let mut calls = 0u32;
+        let out = BoundedRun::new(&cap)
+            .poll_interval(Duration::from_millis(50))
+            .run_observed(sh("sleep 0.5; echo done", true), &mut |_| {
+                calls += 1;
+                PollAction::Continue
+            })
+            .expect("no deadline is not an error");
+        assert!(out.status.success());
+        assert!(
+            calls >= 3,
+            "the observer must be polled with no timeout set: {calls}"
+        );
+    }
+
+    #[test]
+    fn the_observer_can_kill_the_whole_group() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("observe-kill");
+        let marker = tmp("observe-kill-marker");
+        let _ = std::fs::remove_file(&marker);
+        let t0 = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(60))
+            .poll_interval(Duration::from_millis(50))
+            .run_observed(
+                sh(
+                    &[
+                        "echo working; (sleep 3; touch '",
+                        &marker.display().to_string(),
+                        "') & sleep 300",
+                    ]
+                    .concat(),
+                    true,
+                ),
+                &mut |p| {
+                    if p.elapsed >= Duration::from_millis(400) {
+                        PollAction::KillGroup("pulse budget spent".to_owned())
+                    } else {
+                        PollAction::Continue
+                    }
+                },
+            )
+            .expect_err("an observer kill ends the run");
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        let msg = err.to_string();
+        assert!(msg.contains(OBSERVER_MARKER), "{msg}");
+        assert!(msg.contains("pulse budget spent"), "{msg}");
+        assert!(
+            msg.contains("working"),
+            "the tail travels with the kill: {msg}"
+        );
+        assert!(!cap.exists());
+        std::thread::sleep(Duration::from_secs(4));
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!survived, "the observer's kill must reach the grandchild");
+    }
+
+    #[test]
+    fn a_leader_that_exits_while_a_grandchild_holds_the_pipe_is_a_wedge() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("survivor");
+        let marker = tmp("survivor-marker");
+        let _ = std::fs::remove_file(&marker);
+        let script = [
+            "(sleep 3; touch '",
+            &marker.display().to_string(),
+            "') & sleep 300 | cat & echo started; exit 0",
+        ]
+        .concat();
+        let mut exited = false;
+        let t0 = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(120))
+            .await_group(Duration::from_millis(500))
+            .poll_interval(Duration::from_millis(50))
+            .run_observed(sh(&script, true), &mut |p| {
+                exited |= p.leader_exited;
+                PollAction::Continue
+            })
+            .expect_err("a silent group behind an exited leader is a wedge");
+        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let msg = err.to_string();
+        assert!(msg.contains(SURVIVOR_MARKER), "{msg}");
+        assert!(msg.contains("started"), "{msg}");
+        assert!(exited, "the observer is told the leader is gone");
+        std::thread::sleep(Duration::from_secs(4));
+        let survived = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        assert!(!survived, "the surviving group must be killed");
+    }
+
+    #[test]
+    fn a_group_that_drains_returns_the_leaders_status_and_all_output() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("survivor-drains");
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .await_group(Duration::from_secs(5))
+            .poll_interval(Duration::from_millis(50))
+            .run(sh("(sleep 0.5; echo late) & echo early; exit 4", true))
+            .expect("a group that ends on its own is not a wedge");
+        assert_eq!(out.status.code(), Some(4));
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(text.contains("early") && text.contains("late"), "{text}");
+    }
+
+    #[test]
+    fn a_survivor_that_keeps_printing_is_never_killed() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("survivor-progress");
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .await_group(Duration::from_millis(400))
+            .poll_interval(Duration::from_millis(50))
+            .run(sh(
+                "(for i in 1 2 3 4 5 6 7 8; do sleep 0.1; echo tick; done) & exit 0",
+                true,
+            ))
+            .expect("a descendant still making output is work, not a wedge");
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).matches("tick").count(),
+            8
+        );
+    }
+
+    #[test]
+    fn await_group_without_an_own_group_returns_at_the_leaders_exit() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("survivor-nogroup");
+        let t0 = Instant::now();
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .await_group(Duration::from_secs(20))
+            .poll_interval(Duration::from_millis(50))
+            .run(sh("sleep 8 & echo hi", false))
+            .expect("not an error");
+        assert!(out.status.success());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn without_await_group_a_surviving_grandchild_is_not_waited_for() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("survivor-off");
+        let t0 = Instant::now();
+        let out = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(30))
+            .poll_interval(Duration::from_millis(50))
+            .run_observed(sh("sleep 8 | cat & echo hi", true), &mut |_| {
+                PollAction::Continue
+            })
+            .expect("today's contract: the leader's exit ends the run");
+        assert!(out.status.success());
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     }
 }
