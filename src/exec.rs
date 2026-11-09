@@ -43,8 +43,6 @@
 //! hold the descriptor, and a grandchild appending afterwards is harmless.
 //! Capturing (rather than inheriting) keeps the failure text, which matters
 //! because the reason a nix build failed is the last thing it printed.
-//!
-//! Canonical doctrine: `theory/RECONCILER-LIVENESS.md` (P1).
 
 use std::fs::File;
 use std::path::Path;
@@ -353,7 +351,7 @@ impl<'a> BoundedRun<'a> {
     /// If the child needs to outlive this process (an activation that
     /// restarts your own supervisor unit), set `process_group(0)` on `cmd`
     /// **before** calling this. That is exactly what makes hazard 1 live, so
-    /// pair it with a timeout — see `theory/RECONCILER-LIVENESS.md` §IV:
+    /// pair it with a timeout:
     /// self-delivery without a bound is a hang generator.
     pub fn run(&self, cmd: Command) -> std::io::Result<Output> {
         self.run_inner(cmd, None)
