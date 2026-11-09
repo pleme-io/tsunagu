@@ -669,8 +669,10 @@ pub fn kill_process_group(child: &std::process::Child) {
     let Ok(raw) = i32::try_from(child.id()) else {
         return;
     };
-    if let Some(pid) = rustix::process::Pid::from_raw(raw) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
+    if let Some(pid) = rustix::process::Pid::from_raw(raw)
+        && rustix::process::kill_process_group(pid, rustix::process::Signal::Kill).is_err()
+    {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
     }
 }
 
@@ -750,6 +752,26 @@ mod tests {
             "output must still be captured, not merely un-blocked"
         );
         assert!(!cap.exists(), "capture is consumed and cleaned up");
+    }
+
+    #[test]
+    fn a_hung_child_that_leads_no_group_still_ends_the_run_at_its_deadline() {
+        let _serial = FORK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = tmp("timeout-no-group");
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("300");
+        let t0 = Instant::now();
+        let err = BoundedRun::new(&cap)
+            .timeout(Duration::from_secs(1))
+            .poll_interval(Duration::from_millis(50))
+            .run(cmd)
+            .expect_err("a run past its deadline must error, never hang");
+        assert!(is_timeout(&err), "{err}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "must return at its deadline — {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]
