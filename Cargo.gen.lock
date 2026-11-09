@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
-  "cargo_lock_sha256": "7bd488b11f745a3de3fd92f4376e7a974434928f774b7764257b1fbe8c6f219c",
+  "cargo_lock_sha256": "f1b61683d959a9af32f6f168c96c3c322a8f6a7744dc6d2fee897bac667377b2",
   "manifest_sha256": {
-    "Cargo.toml": "a406992a0e74fbbe545e3a30ff24bfa77cca7ada98064c3a07d867690384fac5"
+    "Cargo.toml": "a55e53ead37c8082ccc2ef4be5d030e518042c15840edf2c36d9e0ad38c41d8a"
   },
   "target_resolves": {
     "base": {
@@ -1125,7 +1125,7 @@
           "std"
         ]
       },
-      "tsunagu-0.1.12": {
+      "tsunagu-0.1.13": {
         "runtime_dependencies": [
           {
             "name": "dirs",
@@ -2620,7 +2620,7 @@
     "tracing-core-0.1.36": {
       "edition": "2018"
     },
-    "tsunagu-0.1.12": {
+    "tsunagu-0.1.13": {
       "edition": "2024",
       "lib_target": {
         "name": "tsunagu",
